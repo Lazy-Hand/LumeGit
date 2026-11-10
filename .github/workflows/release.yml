@@ -91,15 +91,7 @@ jobs:
           rm signing.p12
           # Point mygo at the real identity for this build. Handles both
           # existing macos.signingIdentity and a missing macos block.
-          python3 -c "
-import json, sys
-with open('mygo.json') as f:
-    cfg = json.load(f)
-cfg.setdefault('macos', {})['signingIdentity'] = '$APPLE_SIGNING_IDENTITY'
-with open('mygo.json', 'w') as f:
-    json.dump(cfg, f, indent=2, ensure_ascii=False)
-    f.write('\n')
-"
+          python3 -c "import json; cfg = json.load(open('mygo.json')); cfg.setdefault('macos', {})['signingIdentity'] = '$APPLE_SIGNING_IDENTITY'; json.dump(cfg, open('mygo.json', 'w'), indent=2, ensure_ascii=False)"
           echo "Signing with: $APPLE_SIGNING_IDENTITY"
 
       # Universal covers Apple silicon and Intel in one archive. Signs the
