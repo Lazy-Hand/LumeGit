@@ -27,8 +27,13 @@ type Changelists struct {
 const DefaultName = "默认"
 
 // ChangelistsFor returns the repo's grouping, creating an empty set
-// (with only Default) on first access.
+// (with only Default) on first access. The returned pointer is shared
+// by every window that has this repo open — mutation should happen on
+// the UI thread (mygo serializes all windows' view/update on one main
+// thread, so unsynchronized access there is safe).
 func (m *Manager) ChangelistsFor(repoPath string) *Changelists {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if m.lists == nil {
 		m.lists = map[string]*Changelists{}
 	}

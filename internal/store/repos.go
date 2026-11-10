@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"sync"
 	"time"
 )
 
@@ -28,6 +29,7 @@ type Repo struct {
 // os.UserConfigDir()/lumegit so it survives worktree deletion.
 type Manager struct {
 	path  string // JSON file path
+	mu    sync.Mutex // guards repos + lists: shared across all app windows
 	repos []Repo
 	lists map[string]*Changelists // per-repo changelist groups
 }
@@ -69,6 +71,8 @@ func Load() (*Manager, error) {
 // List returns repositories in display order: pinned first, then most
 // recently opened.
 func (m *Manager) List() []Repo {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	out := make([]Repo, len(m.repos))
 	copy(out, m.repos)
 	return out
@@ -77,6 +81,8 @@ func (m *Manager) List() []Repo {
 // Add remembers a repo. If already present, its LastOpened updates and
 // an empty Name is repaired (not overwritten).
 func (m *Manager) Add(path, name string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	path = filepath.Clean(path)
 	for i := range m.repos {
 		if m.repos[i].Path == path {
@@ -97,6 +103,8 @@ func (m *Manager) Add(path, name string) {
 
 // Remove forgets a repo by path.
 func (m *Manager) Remove(path string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	path = filepath.Clean(path)
 	for i := range m.repos {
 		if m.repos[i].Path == path {
@@ -108,6 +116,8 @@ func (m *Manager) Remove(path string) {
 
 // SetPinned toggles a repo's pinned state.
 func (m *Manager) SetPinned(path string, pinned bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	path = filepath.Clean(path)
 	for i := range m.repos {
 		if m.repos[i].Path == path {
@@ -131,6 +141,8 @@ func (m *Manager) sort() {
 
 // Save writes the repo list atomically (temp file + rename).
 func (m *Manager) Save() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	dir := filepath.Dir(m.path)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err

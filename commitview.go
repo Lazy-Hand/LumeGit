@@ -249,6 +249,12 @@ func (a *app) pickView(c *ui.Context, t *ui.Theme) {
 					OnClick(a.browseAndOpen)
 				action.Button(c, "打开", action.ButtonProps{Variant: action.Default, Size: theme.Middle}).
 					OnClick(a.openPickedRepo)
+				action.Button(c, "新窗口打开", action.ButtonProps{Variant: action.Text, Size: theme.Middle}).
+					OnClick(func() {
+						if p := strings.TrimSpace(a.pickPath); p != "" {
+							spawnWindow(p)
+						}
+					})
 			})
 		})
 	})
@@ -327,10 +333,15 @@ func (a *app) repoRowView(c *ui.Context, r store.Repo) {
 		})
 		action.Button(c, "打开", action.ButtonProps{Variant: action.Text, Size: theme.Small}).
 			OnClick(func() { a.openRepo(r.Path) })
+		action.Button(c, "新窗口", action.ButtonProps{Variant: action.Text, Size: theme.Small}).
+			OnClick(func() { spawnWindow(r.Path) })
 	})
 	row.ContextMenu(func(m *ui.Menu) {
 		if m.Item("置顶").Chosen() {
 			a.pinRepo(r.Path, !r.Pinned)
+		}
+		if m.Item("在新窗口打开").Chosen() {
+			spawnWindow(r.Path)
 		}
 		m.Separator()
 		if m.Item("移除").Chosen() {
@@ -412,6 +423,42 @@ func (a *app) browseAndOpen() {
 			a.openPickedRepo()
 		})
 	}()
+}
+
+// browseAndOpenNewWindow asks for a folder, then opens it in a NEW
+// window — the current window keeps its repo.
+func (a *app) browseAndOpenNewWindow() {
+	if a.win == nil {
+		return
+	}
+	w := a.updater()
+	go func() {
+		paths, err := mygo.Dialog.Open(mygo.OpenDialogOptions{
+			Parent:    a.win,
+			Title:     "在新窗口打开仓库",
+			Message:   "选择一个 Git 仓库文件夹",
+			Directory: true,
+		})
+		w.update(func() {
+			if err != nil || len(paths) == 0 {
+				return
+			}
+			spawnWindow(paths[0])
+		})
+	}()
+}
+
+// closeRepo releases the open repository and returns this window to the
+// project picker — the window itself stays open.
+func (a *app) closeRepo() {
+	a.commit.stopWatch()
+	a.commit.RepoPath = ""
+	a.commit.Snap = nil
+	a.commit.lists = nil
+	a.history.reset()
+	a.shelf.reset()
+	a.branches.reset()
+	a.pickPath = ""
 }
 
 // commitView is the main workspace: header + tabs + active page.
@@ -655,6 +702,27 @@ func (a *app) headerView(c *ui.Context, t *ui.Theme) {
 	tk := theme.TokensOf(c)
 	ui.Row(c).Padding(10, 16).Gap(12).AlignItems(ui.Center).Background(tk.BgContainer).Children(func() {
 		ui.Text(c, baseName(m.RepoPath)).Bold()
+		// IDEA-style "project switcher" — left-click opens a menu listing
+		// recent repos, the new-window action, and a way back to the picker.
+		action.Button(c, "⌄", action.ButtonProps{Variant: action.Text, Size: theme.Small}).
+			Menu(func(mn *ui.Menu) {
+				for _, r := range a.reposList() {
+					if r.Path == m.RepoPath {
+						continue // already open here
+					}
+					p := r.Path
+					if mn.Item("切换到 " + r.Name).Chosen() {
+						a.openRepo(p)
+					}
+				}
+				mn.Separator()
+				if mn.Item("在新窗口打开仓库…").Chosen() {
+					a.browseAndOpenNewWindow()
+				}
+				if mn.Item("关闭仓库，回到列表").Chosen() {
+					a.closeRepo()
+				}
+			})
 		if m.Snap != nil {
 			branch := m.Snap.HeadName
 			if m.Snap.Detached {
