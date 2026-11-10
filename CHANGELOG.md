@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.1.8] - 2026-11-10
+
+- 修复：fsnotify 事件风暴时并发 Snapshot 堆叠导致 fd 耗尽（refreshQuiet 节流）
+- 性能：Snapshot 每次少一次 `git rev-parse` 调用
+
 ## [0.1.7] - 2026-11-10
 
 - 修复：大仓库下文件 watcher 耗尽 fd（too many open files）——改为只 watch .git 控制文件 + worktree 根目录
