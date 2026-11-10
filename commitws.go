@@ -124,6 +124,10 @@ type commitModel struct {
 	// nil while no repo is open or the watcher failed to start.
 	watchCancel context.CancelFunc
 
+	// quietRunning throttles refreshQuiet so a burst of fsnotify events
+	// doesn't pile up concurrent Snapshot workers and their git fds.
+	quietRunning bool
+
 	// pushDlg backs the Push confirmation dialog (IDEA: push preview).
 	pushDlg pushDialog
 
@@ -403,16 +407,23 @@ func (m *commitModel) startWatch(w updater) {
 }
 
 // refreshQuiet is refresh without the busy banner — background events
-// shouldn't flash "正在获取状态…" over the UI.
+// shouldn't flash "正在获取状态…" over the UI. A quiet refresh already
+// in flight is not stacked: the watcher fires bursts of events during
+// one logical change, and spawning a Snapshot for each just burns fd.
 func (m *commitModel) refreshQuiet(ctx context.Context, w updater) {
 	if m.RepoPath == "" {
 		return
 	}
+	if m.quietRunning {
+		return // a refresh is already running — one is enough
+	}
+	m.quietRunning = true
 	gen := m.gen
 	go func() {
 		repo := git.NewRepo(m.RepoPath)
 		snap, err := repo.Snapshot(ctx)
 		w.update(func() {
+			m.quietRunning = false
 			if gen != m.gen {
 				return
 			}

@@ -73,21 +73,15 @@ func (r *Repo) Snapshot(ctx context.Context) (*Snapshot, error) {
 }
 
 // detectInProgress checks gitdir control files for operations that
-// change what a commit means. Cheap: one git invocation.
+// change what a commit means. One git invocation — `--path-format=absolute`
+// already covers the old `--git-dir` case (relative paths get anchored
+// to the worktree, absolute stays as-is).
 func detectInProgress(ctx context.Context, r *Repo) string {
-	// `git rev-parse --git-path <p>` per file would be slow; one
-	// `git rev-parse --git-dir` plus filesystem probes is simpler and
-	// robust for the well-known locations (some are inside worktrees/<id>).
-	res, err := r.RunOK(ctx, "rev-parse", "--git-dir")
+	res, err := r.RunOK(ctx, "rev-parse", "--path-format=absolute", "--git-dir")
 	if err != nil {
 		return ""
 	}
 	gitDir := strings.TrimSpace(res.Output())
-	// --git-dir may return a relative path (".git") — anchor it.
-	res2, err := r.RunOK(ctx, "rev-parse", "--path-format=absolute", "--git-dir")
-	if err == nil {
-		gitDir = strings.TrimSpace(res2.Output())
-	}
 	has := func(name string) bool { return fileExists(gitDir + "/" + name) }
 
 	switch {
