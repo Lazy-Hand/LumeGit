@@ -64,10 +64,37 @@ jobs:
       - name: Test
         run: go test ./...
 
+      # Import the Apple Development signing cert+key into a throwaway
+      # keychain so every build carries the same identity — TCC grants
+      # then survive updates. Falls back to ad-hoc when secrets are absent.
+      - name: Set up code signing
+        env:
+          APPLE_SIGNING_P12: ${{ secrets.APPLE_SIGNING_P12 }}
+          APPLE_SIGNING_P12_PASSWORD: ${{ secrets.APPLE_SIGNING_P12_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          set -euo pipefail
+          if [ -z "$APPLE_SIGNING_P12" ] || [ -z "$APPLE_SIGNING_IDENTITY" ]; then
+            echo "No signing secrets configured — building ad-hoc."
+            exit 0
+          fi
+          KEYCHAIN=build-signing.keychain-db
+          KEYCHAIN_PASSWORD="$(openssl rand -base64 16)"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          echo "$APPLE_SIGNING_P12" | base64 --decode > signing.p12
+          security import signing.p12 -k "$KEYCHAIN" \
+            -P "$APPLE_SIGNING_P12_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | sed 's/"//g')
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          rm signing.p12
+          sed -i '' "s/\"signingIdentity\": \".*\"/\"signingIdentity\": \"$APPLE_SIGNING_IDENTITY\"/" mygo.json
+          echo "Signing with: $APPLE_SIGNING_IDENTITY"
+
       # Universal covers Apple silicon and Intel in one archive. Signs the
       # update with MYGO_UPDATER_PRIVATE_KEY and uploads the DMG, the signed
       # update archive and update-darwin-universal.json to the draft release.
-      # Ad-hoc code signing while no Developer ID is configured.
       - name: Build and upload
         env:
           GH_TOKEN: ${{ github.token }}
