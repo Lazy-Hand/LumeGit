@@ -155,8 +155,17 @@ func (s *Snapshot) Progress() ConflictProgress {
 }
 
 // Continue resumes the in-progress merge/rebase/cherry-pick.
+// GIT_EDITOR=true keeps the default message without spawning an editor:
+// a GUI client (and CI) has no terminal for git to open one in.
 func (r *Repo) Continue(ctx context.Context, kind string) (*RunResult, error) {
-	return r.RunOK(ctx, kind, "--continue")
+	res, err := r.runEnv(ctx, []string{"GIT_EDITOR=true"}, kind, "--continue")
+	if err != nil {
+		return res, err
+	}
+	if !res.ExitOK() {
+		return res, &GitError{Args: []string{kind, "--continue"}, Stderr: strings.TrimSpace(res.OutputOfStderr())}
+	}
+	return res, nil
 }
 
 // Abort cancels the in-progress op, restoring the pre-op state.
