@@ -67,7 +67,9 @@ func (h *historyModel) ensureLoaded(repoPath string, w updater) {
 	h.load(repoPath, w)
 }
 
-// load fetches the commit list in a worker.
+// load fetches the commit list in a worker. The unpushed set runs
+// concurrently — IDEA fans these reads out so the log doesn't wait on
+// upstream bookkeeping.
 func (h *historyModel) load(repoPath string, w updater) {
 	h.gen++
 	gen := h.gen
@@ -78,30 +80,44 @@ func (h *historyModel) load(repoPath string, w updater) {
 		h.filterGrep != "" || h.filterPath != "" || h.filterAll
 	go func() {
 		repo := git.NewRepo(repoPath)
-		commits, err := repo.LogFiltered(context.Background(), git.LogOptions{
-			Max:    300,
-			Branch: h.filterBranch,
-			Author: h.filterAuthor,
-			Grep:   h.filterGrep,
-			Path:   h.filterPath,
-			All:    h.filterAll,
-		})
-		// Unpushed set for highlight (best-effort — failure just means
-		// no highlight, not an error the user cares about here).
-		unpushed, _ := repo.UnpushedSet(context.Background())
+		type logResult struct {
+			commits []git.Commit
+			err     error
+		}
+		logCh := make(chan logResult, 1)
+		unpushedCh := make(chan map[string]bool, 1)
+		go func() {
+			commits, err := repo.LogFiltered(context.Background(), git.LogOptions{
+				Max:    300,
+				Branch: h.filterBranch,
+				Author: h.filterAuthor,
+				Grep:   h.filterGrep,
+				Path:   h.filterPath,
+				All:    h.filterAll,
+			})
+			logCh <- logResult{commits, err}
+		}()
+		go func() {
+			// Unpushed set for highlight (best-effort — failure just means
+			// no highlight, not an error the user cares about here).
+			unpushed, _ := repo.UnpushedSet(context.Background())
+			unpushedCh <- unpushed
+		}()
+		lr := <-logCh
+		unpushed := <-unpushedCh
 		w.update(func() {
 			if gen != h.gen {
 				return
 			}
 			h.loading = false
-			if err != nil {
-				h.err = err.Error()
+			if lr.err != nil {
+				h.err = lr.err.Error()
 				h.commits = nil
 				return
 			}
 			h.err = ""
-			h.commits = commits
-			h.graph = git.BuildGraph(commits)
+			h.commits = lr.commits
+			h.graph = git.BuildGraph(lr.commits)
 			h.unpushed = unpushed
 			h.ensureSelection(repoPath, w)
 		})

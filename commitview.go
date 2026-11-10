@@ -1401,6 +1401,10 @@ func (a *app) commitListPane(c *ui.Context, t *ui.Theme) {
 	ui.Column(c).Fill().Gap(0).Background(tk.BgContainer).Children(func() {
 		ui.Row(c).Padding(8, 12).Gap(8).AlignItems(ui.Center).Children(func() {
 			ui.Text(c, "提交").Bold()
+			// Spin while log/files/diff is in flight so refresh/filter shows
+			// something is happening (IDEA also spins the log toolbar).
+			busy := m.loading || m.filesLoading || m.diffLoading
+			feedback.Spin(c, feedback.SpinProps{Size: theme.Small, Spinning: &busy}, nil)
 			ui.Text(c, "").Grow(1)
 			action.Button(c, "跳转…", action.ButtonProps{Variant: action.Text, Size: theme.Small}).
 				OnClick(func() {
@@ -1711,6 +1715,8 @@ func (a *app) stashListPane(c *ui.Context, t *ui.Theme) {
 	ui.Column(c).Fill().Gap(0).Background(tk.BgContainer).Children(func() {
 		ui.Row(c).Padding(8, 12).Gap(8).AlignItems(ui.Center).Children(func() {
 			ui.Text(c, "搁置").Bold()
+			shelfBusy := m.loading || m.filesLoading || m.diffLoading
+			feedback.Spin(c, feedback.SpinProps{Size: theme.Small, Spinning: &shelfBusy}, nil)
 			ui.Text(c, "").Grow(1)
 			action.Button(c, "刷新", action.ButtonProps{Variant: action.Text, Size: theme.Small}).
 				Disabled(m.loading).OnClick(func() {

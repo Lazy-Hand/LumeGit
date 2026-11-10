@@ -44,7 +44,8 @@ func (s *shelfModel) ensureLoaded(repoPath string, w updater) {
 	s.load(repoPath, w)
 }
 
-// load fetches the stash list and the patch shelf.
+// load fetches the stash list and the patch shelf — the two queries run
+// concurrently so total time is max(stash, shelf), not their sum.
 func (s *shelfModel) load(repoPath string, w updater) {
 	s.gen++
 	gen := s.gen
@@ -53,31 +54,45 @@ func (s *shelfModel) load(repoPath string, w updater) {
 	s.err = ""
 	go func() {
 		repo := git.NewRepo(repoPath)
-		stashes, err := repo.Stashes(context.Background())
-		shelfEntries, _ := repo.Shelf(context.Background())
+		type stashResult struct {
+			stashes []git.Stash
+			err     error
+		}
+		stashCh := make(chan stashResult, 1)
+		shelfCh := make(chan []git.ShelfEntry, 1)
+		go func() {
+			stashes, err := repo.Stashes(context.Background())
+			stashCh <- stashResult{stashes, err}
+		}()
+		go func() {
+			shelfEntries, _ := repo.Shelf(context.Background())
+			shelfCh <- shelfEntries
+		}()
+		sr := <-stashCh
+		shelfEntries := <-shelfCh
 		w.update(func() {
 			if gen != s.gen {
 				return
 			}
 			s.loading = false
-			if err != nil {
-				s.err = err.Error()
+			if sr.err != nil {
+				s.err = sr.err.Error()
 				return
 			}
-			s.stashes = stashes
+			s.stashes = sr.stashes
 			s.shelf = shelfEntries
 			// Keep selection valid; else pick the newest.
 			found := false
-			for _, st := range stashes {
+			for _, st := range sr.stashes {
 				if st.Name == s.selectedID {
 					found = true
 					break
 				}
 			}
-			if !found && len(stashes) > 0 {
-				s.selectStash(repoPath, stashes[0].Name, w)
+			if !found && len(sr.stashes) > 0 {
+				s.selectStash(repoPath, sr.stashes[0].Name, w)
 			}
-			if len(stashes) == 0 && len(shelfEntries) == 0 {
+			if len(sr.stashes) == 0 && len(shelfEntries) == 0 {
 				s.selectedID = ""
 				s.files = nil
 				s.diff = nil
