@@ -1,0 +1,85 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write # the draft release, and the uploads to it
+
+jobs:
+  # The draft exists before the build starts so `mygo build -upload` has
+  # a release to put the installers and update files in. Its body is the
+  # tag's section of CHANGELOG.md, which the update window shows too,
+  # plus the compare link of generated notes.
+  draft-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          # The version's section of CHANGELOG.md: its heading and the
+          # leading blank line left out, up to the next ## heading.
+          notes="$(awk -v v="$version" '
+            $0 ~ "^## \\[?" v "\\]?" { insec = 1; next }
+            insec && /^## / { insec = 0 }
+            insec && ($0 != "" || started) { started = 1; print }
+          ' CHANGELOG.md)"
+          test -n "$notes" || { echo "CHANGELOG.md has no section for $version" >&2; exit 1; }
+          prev="$(git ls-remote --tags origin 'v*' | grep -vF "$GITHUB_REF_NAME" \
+            | grep -oE 'refs/tags/.*' | cut -d/ -f3 | sort -V | tail -1)"
+          if [ -n "$prev" ]; then
+            notes="$notes
+
+          **Full Changelog**: https://github.com/$GITHUB_REPOSITORY/compare/$prev...$GITHUB_REF_NAME"
+          fi
+          if ! gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+              --draft --verify-tag --title "$GITHUB_REF_NAME" --notes "$notes"
+          else
+            gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --notes "$notes"
+          fi
+
+  build-macos:
+    needs: draft-release
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Set version from tag
+        # The tag is the version of record; stamp it into mygo.json so the
+        # bundle, the update manifest and the release agree (v1.2.3 -> 1.2.3).
+        run: |
+          sed -i '' "s/\"version\": \".*\"/\"version\": \"${GITHUB_REF_NAME#v}\"/" mygo.json
+
+      - name: Test
+        run: go test ./...
+
+      # Universal covers Apple silicon and Intel in one archive. Signs the
+      # update with MYGO_UPDATER_PRIVATE_KEY and uploads the DMG, the signed
+      # update archive and update-darwin-universal.json to the draft release.
+      # Ad-hoc code signing while no Developer ID is configured.
+      - name: Build and upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MYGO_UPDATER_PRIVATE_KEY: ${{ secrets.MYGO_UPDATER_PRIVATE_KEY }}
+        run: |
+          go run github.com/egoist/mygo/cmd/mygo build \
+            -platform darwin/universal -upload
+
+  publish:
+    needs: build-macos
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false
