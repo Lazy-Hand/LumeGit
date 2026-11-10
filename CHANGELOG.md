@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.1.7] - 2026-11-10
+
+- 修复：大仓库下文件 watcher 耗尽 fd（too many open files）——改为只 watch .git 控制文件 + worktree 根目录
+- 性能：历史/搁置 tab 并发加载 + Spin 加载指示
+- 性能：分支 tab 单 `git for-each-ref` 查询 + 乐观插入新分支
+
 ## [0.1.6] - 2026-11-10
 
 - 分支 tab 性能：单 `git for-each-ref` 并发查询 + Spin 加载指示，刷新/建分支即时反馈
