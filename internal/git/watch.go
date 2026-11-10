@@ -41,30 +41,20 @@ func (r *Repo) Watch(ctx context.Context, onChange func()) error {
 	// flood us with object/pack writes we don't care about.
 	watchDirs := map[string]bool{}
 	add := func(p string) {
-		// fsnotify's Add is idempotent for the same path, but we also
-		// need to skip directories that disappeared between listing and
-		// watching (a file that got removed mid-scan).
 		if watchDirs[p] {
 			return
 		}
 		watchDirs[p] = true
 		_ = w.Add(p) // errors ignored: a vanished dir is a no-op
 	}
+	// IDEA watches the git metadata (index/HEAD/refs/sequencer markers)
+	// plus the worktree *root only* — it does not recurse into every
+	// subdirectory. Recursion was the fd-eater: a repo with node_modules/
+	// build/ target/ has thousands of dirs, each costing one fsnotify fd
+	// and easily exhausting the 256-fd macOS soft limit. Top-level files
+	// still fire (root add covers them); deeper edits surface on the
+	// next git status check triggered by .git activity or manual refresh.
 	add(r.Worktree)
-	_ = filepath.WalkDir(r.Worktree, func(p string, d os.DirEntry, err error) error {
-		if err != nil {
-			return nil // skip vanished entries
-		}
-		if !d.IsDir() {
-			return nil
-		}
-		// Don't descend into .git's internals — object churn is noise.
-		if p == gitDir || strings.HasPrefix(p, gitDir+string(os.PathSeparator)) {
-			return filepath.SkipDir
-		}
-		add(p)
-		return nil
-	})
 	// Index + HEAD + sequencer markers: one file each, not the dir.
 	for _, name := range []string{
 		"index", "HEAD", "MERGE_HEAD", "CHERRY_PICK_HEAD",
@@ -75,15 +65,17 @@ func (r *Repo) Watch(ctx context.Context, onChange func()) error {
 			add(p)
 		}
 	}
-	// Also watch .git/refs so new branches/tags invalidate quickly.
+	// Also watch .git/refs (but only its top level — refs/heads, refs/tags,
+	// refs/remotes; deeper would again multiply fds).
 	refsDir := filepath.Join(gitDir, "refs")
 	if fileExists(refsDir) {
-		_ = filepath.WalkDir(refsDir, func(p string, d os.DirEntry, err error) error {
-			if err == nil && d.IsDir() {
+		add(refsDir)
+		for _, sub := range []string{"heads", "tags", "remotes"} {
+			p := filepath.Join(refsDir, sub)
+			if fileExists(p) {
 				add(p)
 			}
-			return nil
-		})
+		}
 	}
 
 	go func() {
