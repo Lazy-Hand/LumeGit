@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#2b3040"/>
+      <stop offset="1" stop-color="#171a24"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="24" y="24" width="976" height="976" rx="228" fill="url(#bg)"/>
+
+  <!-- window dots -->
+  <circle cx="128" cy="128" r="20" fill="#5a6072"/>
+  <circle cx="188" cy="128" r="20" fill="#5a6072"/>
+  <circle cx="248" cy="128" r="20" fill="#5a6072"/>
+
+  <!-- git branch mark: incoming -> junction -> right + down -->
+  <path d="M 300 380 L 470 550" stroke="#a78bfa" stroke-width="52" stroke-linecap="round" fill="none"/>
+  <path d="M 470 550 L 724 550" stroke="#8b6ef5" stroke-width="52" stroke-linecap="round" fill="none"/>
+  <path d="M 470 550 L 470 690" stroke="#7c5cf0" stroke-width="52" stroke-linecap="round" fill="none"/>
+
+  <!-- nodes -->
+  <circle cx="300" cy="380" r="52" fill="#a78bfa"/>
+  <circle cx="470" cy="550" r="52" fill="#8b6ef5"/>
+  <circle cx="724" cy="550" r="52" fill="#5eead4"/>
+  <circle cx="470" cy="738" r="52" fill="#7c5cf0"/>
+</svg>

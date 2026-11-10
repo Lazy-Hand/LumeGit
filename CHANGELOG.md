@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.1.1] - 2026-11-10
+
+- 新应用图标：深色底 + 分支汇合符号，与 LumeShell 同家族风格
+- 修复：`git merge --continue` 在无 TTY 环境（CI/后台）下失败
+
 ## [0.1.0] - 2026-11-10
 
 - 首个发布：按 IntelliJ IDEA Git 工具窗口对齐 P0–P3 共 24 项功能
