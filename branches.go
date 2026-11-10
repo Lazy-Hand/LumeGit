@@ -73,31 +73,51 @@ func (b *branchModel) load(repoPath string, w updater) {
 	b.lastLoaded = repoPath
 	b.loading = true
 	b.err = ""
+	// Run the three queries concurrently — IDEA reads refs in one shot
+	// and never blocks the UI on serial fork/exec. The slowest call
+	// (usually worktree list on a big repo) bounds total time.
 	go func() {
 		repo := git.NewRepo(repoPath)
-		local, remote, err := repo.Branches(context.Background())
-		tags, terr := repo.Tags(context.Background())
-		subs, _ := repo.Submodules(context.Background())
-		wts, _ := repo.Worktrees(context.Background())
+		type refsResult struct {
+			local, remote []git.Branch
+			tags          []git.Tag
+			err           error
+		}
+		refsCh := make(chan refsResult, 1)
+		subsCh := make(chan []git.Submodule, 1)
+		wtsCh := make(chan []git.Worktree, 1)
+		go func() {
+			local, remote, tags, err := repo.RefsAll(context.Background())
+			refsCh <- refsResult{local, remote, tags, err}
+		}()
+		go func() {
+			s, _ := repo.Submodules(context.Background())
+			subsCh <- s
+		}()
+		go func() {
+			wts, _ := repo.Worktrees(context.Background())
+			wtsCh <- wts
+		}()
+		refs := <-refsCh
+		subs := <-subsCh
+		wts := <-wtsCh
 		w.update(func() {
 			if gen != b.gen {
 				return
 			}
 			b.loading = false
-			if err != nil {
-				b.err = err.Error()
+			if refs.err != nil {
+				b.err = refs.err.Error()
 				return
 			}
-			if terr != nil {
-				b.err = terr.Error()
-				return
-			}
-			b.local, b.remote, b.tags, b.submodules, b.worktrees = local, remote, tags, subs, wts
+			b.local, b.remote, b.tags, b.submodules, b.worktrees = refs.local, refs.remote, refs.tags, subs, wts
 		})
 	}()
 }
 
-// op runs one branch mutation then reloads.
+// op runs one branch mutation then reloads. The three re-reads run
+// concurrently, so the whole refresh costs max(submodule, worktree,
+// for-each-ref) — not their sum.
 func (b *branchModel) op(repoPath string, w updater, busyText, doneText string,
 	fn func(*git.Repo) (*git.RunResult, error), after func()) {
 	if b.busy {
@@ -109,10 +129,29 @@ func (b *branchModel) op(repoPath string, w updater, busyText, doneText string,
 	go func() {
 		repo := git.NewRepo(repoPath)
 		res, err := fn(repo)
-		local, remote, _ := repo.Branches(context.Background())
-		tags, _ := repo.Tags(context.Background())
-		subs, _ := repo.Submodules(context.Background())
-		wts, _ := repo.Worktrees(context.Background())
+		type refsResult struct {
+			local, remote []git.Branch
+			tags          []git.Tag
+			err           error
+		}
+		refsCh := make(chan refsResult, 1)
+		subsCh := make(chan []git.Submodule, 1)
+		wtsCh := make(chan []git.Worktree, 1)
+		go func() {
+			local, remote, tags, err := repo.RefsAll(context.Background())
+			refsCh <- refsResult{local, remote, tags, err}
+		}()
+		go func() {
+			s, _ := repo.Submodules(context.Background())
+			subsCh <- s
+		}()
+		go func() {
+			wts, _ := repo.Worktrees(context.Background())
+			wtsCh <- wts
+		}()
+		refs := <-refsCh
+		subs := <-subsCh
+		wts := <-wtsCh
 		w.update(func() {
 			if gen != b.gen {
 				return
@@ -130,7 +169,7 @@ func (b *branchModel) op(repoPath string, w updater, busyText, doneText string,
 			}
 			b.err = ""
 			b.syncOK = doneText
-			b.local, b.remote, b.tags, b.submodules, b.worktrees = local, remote, tags, subs, wts
+			b.local, b.remote, b.tags, b.submodules, b.worktrees = refs.local, refs.remote, refs.tags, subs, wts
 			if after != nil {
 				after()
 			}

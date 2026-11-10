@@ -18,59 +18,70 @@ type Branch struct {
 	HasTrack bool // upstream tracking info present
 }
 
-// Branches lists local and remote branches.
-func (r *Repo) Branches(ctx context.Context) (local []Branch, remote []Branch, err error) {
-	// Local: name US upstream US trackshort US HEAD US oid RS.
-	// trackshort is locale-free ("<" behind, ">" ahead, "<>" both, "=" sync).
-	res, err := r.Run(ctx, "branch", "-vv",
-		"--format=%(refname:short)%1f%(upstream:short)%1f%(upstream:trackshort)%1f%(HEAD)%1f%(objectname:short)%1e")
+// RefsAll is one git for-each-ref call returning every local branch,
+// remote-tracking branch, and tag — IDEA reads refs through the same
+// single shot instead of separate branch/tag commands. The four-tuple
+// result lets callers grab all three ref kinds in one parse.
+func (r *Repo) RefsAll(ctx context.Context) (local, remote []Branch, tags []Tag, err error) {
+	// %(HEAD) is "*" on the checked-out branch — for-each-ref doesn't
+	// have it, but %(symref) does nothing for detached HEAD anyway.
+	// We still need to know the current branch so the UI can star it:
+	// detect it via `symbolic-ref HEAD` (cheap, single call).
+	//
+	// Format per record:  shortname US refname US oid US objtype US
+	// upstream US trackshort US subject RS
+	res, err := r.Run(ctx, "for-each-ref",
+		"--format=%(refname:short)%1f%(refname)%1f%(objectname:short)%1f%(objecttype)%1f%(upstream:short)%1f%(upstream:trackshort)%1f%(subject)%1e",
+		"refs/heads", "refs/remotes", "refs/tags")
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	if !res.ExitOK() {
-		return nil, nil, &GitError{Args: []string{"branch", "-vv"}, Stderr: res.OutputOfStderr()}
+		return nil, nil, nil, &GitError{Args: []string{"for-each-ref"}, Stderr: res.OutputOfStderr()}
 	}
+	current, _ := r.headName(ctx) // detached HEAD → ""
 	for _, rec := range strings.Split(res.Output(), "\x1e") {
 		rec = strings.TrimSpace(rec)
 		if rec == "" {
 			continue
 		}
 		f := strings.Split(rec, "\x1f")
-		if len(f) < 5 {
+		if len(f) < 7 {
 			continue
 		}
-		b := Branch{Name: f[0], OID: f[4], Current: f[3] == "*"}
-		if f[1] != "" {
-			b.Upstream = f[1]
-			b.HasTrack = true
-			// trackshort is a compact symbol pair, no parsing needed
-			// beyond checking for each direction's glyph.
-			ts := f[2]
-			b.Ahead, b.Behind = aheadBehindSymbols(ts)
+		short, refname, oid, objtype := f[0], f[1], f[2], f[3]
+		upstream, trackshort := f[4], f[5]
+		switch {
+		case strings.HasPrefix(refname, "refs/heads/"):
+			b := Branch{Name: short, OID: oid, Current: short == current}
+			if upstream != "" {
+				b.Upstream = upstream
+				b.HasTrack = true
+				b.Ahead, b.Behind = aheadBehindSymbols(trackshort)
+			}
+			local = append(local, b)
+		case strings.HasPrefix(refname, "refs/remotes/"):
+			if strings.HasSuffix(short, "/HEAD") {
+				continue
+			}
+			remote = append(remote, Branch{Name: short, OID: oid, Remote: true})
+		case strings.HasPrefix(refname, "refs/tags/"):
+			t := Tag{Name: short, OID: oid}
+			if objtype == "tag" {
+				t.Annotated = true
+				t.Message = f[6]
+			}
+			tags = append(tags, t)
 		}
-		local = append(local, b)
 	}
+	return local, remote, tags, nil
+}
 
-	// Remote tracking refs.
-	res2, err := r.Run(ctx, "branch", "-r",
-		"--format=%(refname:short)%1f%(objectname:short)%1e")
-	if err != nil {
-		return local, nil, err
-	}
-	if res2.ExitOK() {
-		for _, rec := range strings.Split(res2.Output(), "\x1e") {
-			rec = strings.TrimSpace(rec)
-			if rec == "" {
-				continue
-			}
-			f := strings.Split(rec, "\x1f")
-			if len(f) < 2 || strings.HasSuffix(f[0], "/HEAD") {
-				continue
-			}
-			remote = append(remote, Branch{Name: f[0], OID: f[1], Remote: true})
-		}
-	}
-	return local, remote, nil
+// Branches lists local and remote branches. Kept for callers that don't
+// want tags; internally it uses RefsAll so there's still one git call.
+func (r *Repo) Branches(ctx context.Context) (local []Branch, remote []Branch, err error) {
+	local, remote, _, err = r.RefsAll(ctx)
+	return local, remote, err
 }
 
 // Checkout switches to a branch (creating it first when create is set).

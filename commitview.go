@@ -1999,6 +1999,10 @@ func (a *app) branchListPane(c *ui.Context, t *ui.Theme) {
 	ui.Column(c).Fill().Gap(0).Background(tk.BgContainer).Children(func() {
 		ui.Row(c).Padding(8, 12).Gap(8).AlignItems(ui.Center).Children(func() {
 			ui.Text(c, "分支").Bold()
+			// Spin while any branch query / mutation runs so refresh doesn't
+			// look dead (IDEA shows a spinner beside the toolbar too).
+			loading := m.loading || m.busy
+			feedback.Spin(c, feedback.SpinProps{Size: theme.Small, Spinning: &loading}, nil)
 			ui.Text(c, "").Grow(1)
 			action.Button(c, "+", action.ButtonProps{Variant: action.Text, Size: theme.Small}).
 				OnClick(func() { m.newOpen = !m.newOpen })
@@ -2088,12 +2092,27 @@ func (a *app) branchListPane(c *ui.Context, t *ui.Theme) {
 	})
 }
 
-// createBranch makes + checks out a new local branch.
+// createBranch makes + checks out a new local branch. The op's after
+// hook runs after the refresh landed — but the user shouldn't wait for
+// a git call to see the new branch appear, so we optimistically insert
+// it into m.local right away; the async reload reconciles.
 func (a *app) createBranch() {
 	m := &a.branches
 	name := strings.TrimSpace(m.newName)
 	if name == "" {
 		return
+	}
+	// Optimistic insert — IDEA updates the branch tree as soon as the
+	// mutation returns, before the next status reload lands.
+	exists := false
+	for _, b := range m.local {
+		if b.Name == name {
+			exists = true
+			break
+		}
+	}
+	if !exists {
+		m.local = append(m.local, git.Branch{Name: name})
 	}
 	m.op(a.commit.RepoPath, a.updater(), "正在创建…", "已创建并切换",
 		func(r *git.Repo) (*git.RunResult, error) { return r.Checkout(context.Background(), name, true) },
