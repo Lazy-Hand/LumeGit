@@ -85,8 +85,15 @@ func main() {
 }
 
 // spawnWindow creates one independent workspace window. A non-empty
-// path opens that repo immediately; empty shows the picker.
+// path opens that repo immediately; empty shows the picker. Tests may
+// stub it via spawnWindowHook — in headless mode NewWindow would panic.
+var spawnWindowHook func(path string)
+
 func spawnWindow(openPath string) {
+	if spawnWindowHook != nil {
+		spawnWindowHook(openPath)
+		return
+	}
 	a := &app{}
 	a.filesPaneW = 280
 	a.histListW = 380

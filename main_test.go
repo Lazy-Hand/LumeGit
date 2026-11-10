@@ -57,7 +57,10 @@ func TestFileSelectionShowsDiff(t *testing.T) {
 }
 
 // TestOpenRepoFlow drives the real open-repo path headlessly with a
-// temp git repo.
+// temp git repo. The picker buttons call spawnWindow (which would try
+// to create a real OS window), so the test stubs that hook and then
+// exercises openPickedRepo directly — that's the same code path a
+// spawned window runs.
 func TestOpenRepoFlow(t *testing.T) {
 	dir := t.TempDir()
 	cmd := exec.Command("git", "init", "-q", "-b", "main", ".")
@@ -65,6 +68,10 @@ func TestOpenRepoFlow(t *testing.T) {
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Skipf("git init failed: %v: %s", err, out)
 	}
+	var spawned []string
+	spawnWindowHook = func(p string) { spawned = append(spawned, p) }
+	t.Cleanup(func() { spawnWindowHook = nil })
+
 	a := &app{}
 	// Sync publish: run update closures immediately (headless).
 	a.commit.publish = func(fn func()) { fn() }
@@ -73,8 +80,12 @@ func TestOpenRepoFlow(t *testing.T) {
 	if err := tt.Click("打开"); err != nil {
 		t.Fatalf("click Open: %v", err)
 	}
-	// The open runs on a goroutine; wait (bounded) for its publish to
-	// land, then settle a frame.
+	if len(spawned) != 1 || spawned[0] != dir {
+		t.Fatalf("expected picker to spawn a new window with %q, got %v", dir, spawned)
+	}
+
+	// The spawned window's open runs the same path — run it inline.
+	a.openPickedRepo()
 	deadline := time.Now().Add(2 * time.Second)
 	for a.commit.RepoPath == "" && a.commit.busy && time.Now().Before(deadline) {
 		time.Sleep(5 * time.Millisecond)
