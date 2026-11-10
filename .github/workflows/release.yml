@@ -89,7 +89,17 @@ jobs:
           security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | sed 's/"//g')
           security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
           rm signing.p12
-          sed -i '' "s/\"signingIdentity\": \".*\"/\"signingIdentity\": \"$APPLE_SIGNING_IDENTITY\"/" mygo.json
+          # Point mygo at the real identity for this build. Handles both
+          # existing macos.signingIdentity and a missing macos block.
+          python3 -c "
+import json, sys
+with open('mygo.json') as f:
+    cfg = json.load(f)
+cfg.setdefault('macos', {})['signingIdentity'] = '$APPLE_SIGNING_IDENTITY'
+with open('mygo.json', 'w') as f:
+    json.dump(cfg, f, indent=2, ensure_ascii=False)
+    f.write('\n')
+"
           echo "Signing with: $APPLE_SIGNING_IDENTITY"
 
       # Universal covers Apple silicon and Intel in one archive. Signs the
