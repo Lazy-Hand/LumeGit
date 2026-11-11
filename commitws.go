@@ -120,13 +120,22 @@ type commitModel struct {
 	// stored action.
 	pendingRevert revertAsk
 
-	// watchCancel stops the filesystem watcher for the current repo.
-	// nil while no repo is open or the watcher failed to start.
-	watchCancel context.CancelFunc
+	// pollCancel stops the refs-fingerprint poller for the current repo.
+	// nil while no repo is open or the poller isn't running.
+	pollCancel context.CancelFunc
 
-	// quietRunning throttles refreshQuiet so a burst of fsnotify events
-	// doesn't pile up concurrent Snapshot workers and their git fds.
-	quietRunning bool
+	// refreshRunning makes refresh() and the poller's quiet refresh
+	// mutually exclusive — a poller tick while a manual refresh is in
+	// flight is skipped instead of stacking a second `git status`.
+	refreshRunning bool
+
+	// lastFingerprint is the refs/index fingerprint from the most recent
+	// poll; a change means refs moved externally.
+	lastFingerprint string
+
+	// onRefsChanged, when set, runs on the UI thread after a fingerprint
+	// change — windows use it to invalidate cached branch/tag lists.
+	onRefsChanged func()
 
 	// pushDlg backs the Push confirmation dialog (IDEA: push preview).
 	pushDlg pushDialog
@@ -354,17 +363,24 @@ func openRepo(ctx context.Context, dir string) (*git.Snapshot, string, error) {
 }
 
 // refresh loads a fresh snapshot of the current repo. Generation
-// fencing: results from an older gen are dropped on arrival.
+// fencing: results from an older gen are dropped on arrival. One
+// refresh at a time — a call while another is in flight is dropped
+// (the in-flight result is fresher than anything queued behind it).
 func (m *commitModel) refresh(ctx context.Context, w updater) {
 	if m.RepoPath == "" {
 		return
 	}
+	if m.refreshRunning {
+		return
+	}
+	m.refreshRunning = true
 	gen := m.gen
 	m.setBusy(w, true, "正在获取状态…")
 	go func() {
 		repo := git.NewRepo(m.RepoPath)
 		snap, err := repo.Snapshot(ctx)
 		w.update(func() {
+			m.refreshRunning = false
 			if gen != m.gen {
 				return // repo switched or superseded
 			}
@@ -383,47 +399,23 @@ func (m *commitModel) refresh(ctx context.Context, w updater) {
 	}()
 }
 
-// startWatch launches the fsnotify watcher for the open repo; a no-op
-// if one is already running or the repo isn't open. Watch failures
-// aren't fatal (the refresh button still works), so we don't surface
-// them.
-func (m *commitModel) startWatch(w updater) {
-	if m.watchCancel != nil || m.RepoPath == "" {
-		return
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	m.watchCancel = cancel
-	repo := git.NewRepo(m.RepoPath)
-	if err := repo.Watch(ctx, func() {
-		// The watcher fires on its own goroutine; queue a refresh
-		// through the normal update path so it joins gen fencing.
-		w.update(func() {
-			m.refreshQuiet(context.Background(), w)
-		})
-	}); err != nil {
-		cancel()
-		m.watchCancel = nil
-	}
-}
-
-// refreshQuiet is refresh without the busy banner — background events
-// shouldn't flash "正在获取状态…" over the UI. A quiet refresh already
-// in flight is not stacked: the watcher fires bursts of events during
-// one logical change, and spawning a Snapshot for each just burns fd.
+// refreshQuiet is refresh without the busy banner — background triggers
+// (refs poll, window focus) shouldn't flash "正在获取状态…". Shares
+// refreshRunning with refresh() so the two never stack.
 func (m *commitModel) refreshQuiet(ctx context.Context, w updater) {
 	if m.RepoPath == "" {
 		return
 	}
-	if m.quietRunning {
-		return // a refresh is already running — one is enough
+	if m.refreshRunning {
+		return
 	}
-	m.quietRunning = true
+	m.refreshRunning = true
 	gen := m.gen
 	go func() {
 		repo := git.NewRepo(m.RepoPath)
 		snap, err := repo.Snapshot(ctx)
 		w.update(func() {
-			m.quietRunning = false
+			m.refreshRunning = false
 			if gen != m.gen {
 				return
 			}
@@ -441,12 +433,59 @@ func (m *commitModel) refreshQuiet(ctx context.Context, w updater) {
 	}()
 }
 
-// stopWatch kills the watcher. Called when the repo closes.
-func (m *commitModel) stopWatch() {
-	if m.watchCancel != nil {
-		m.watchCancel()
-		m.watchCancel = nil
+// startPolling launches the refs-fingerprint poller for the open repo
+// — the lazygit pattern: instead of watching the worktree (fsnotify
+// storm, fd cost), every 2s we ask git "did refs/index change?" and
+// only then pay for a full Snapshot. Poll failures are ignored; the
+// next tick retries.
+func (m *commitModel) startPolling(w updater) {
+	if m.pollCancel != nil || m.RepoPath == "" {
+		return
 	}
+	ctx, cancel := context.WithCancel(context.Background())
+	m.pollCancel = cancel
+	repoPath := m.RepoPath
+	go func() {
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				repo := git.NewRepo(repoPath)
+				fp, err := repo.RefsFingerprint(ctx)
+				if err != nil {
+					continue
+				}
+				w.update(func() {
+					if m.RepoPath != repoPath {
+						return // repo changed under us
+					}
+					if m.lastFingerprint == "" {
+						m.lastFingerprint = fp
+						return // baseline — don't refresh on first tick
+					}
+					if fp != m.lastFingerprint {
+						m.lastFingerprint = fp
+						m.refreshQuiet(context.Background(), w)
+						if m.onRefsChanged != nil {
+							m.onRefsChanged()
+						}
+					}
+				})
+			}
+		}
+	}()
+}
+
+// stopPolling kills the poller. Called when the repo closes.
+func (m *commitModel) stopPolling() {
+	if m.pollCancel != nil {
+		m.pollCancel()
+		m.pollCancel = nil
+	}
+	m.lastFingerprint = ""
 }
 
 // checkboxState carries the *bool ui.Checkbox binds for one path. Map

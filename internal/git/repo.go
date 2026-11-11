@@ -201,6 +201,16 @@ func (c *commandRunner) runStdin(ctx context.Context, repo *Repo, stdin []byte, 
 	return res, nil
 }
 
+// gitDir returns the absolute .git dir for the repo (per-worktree for
+// linked worktrees).
+func (r *Repo) gitDir(ctx context.Context) (string, error) {
+	res, err := r.Run(ctx, "rev-parse", "--path-format=absolute", "--git-dir")
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(res.Output()), nil
+}
+
 func repoWorktree(r *Repo) string {
 	if r == nil {
 		return "(no worktree)"

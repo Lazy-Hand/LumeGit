@@ -1,7 +1,7 @@
 {
   "name": "LumeGit",
   "identifier": "com.example.lumegit",
-  "version": "0.1.0",
+  "version": "0.1.9",
   "out": "build",
   "updates": {
     "publicKey": "x0xLes3DR3ol6TG6uMVvj8jkqQ6iO1dUbynN7fcVyEs=",

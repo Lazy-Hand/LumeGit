@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.9] - 2026-11-11
+
+- 「分支」tab 移除：header 分支名点击弹出 IDEA 式分支菜单（新建分支/标签/远程/工作树 + 每条分支内嵌切换/合并/变基/比较/重命名/删除）
+- 性能：fsnotify 工作区 watch 改为 lazygit 式 refs 指纹轮询（2s）+ 窗口 focus 刷新——大仓库刷新不再 CPU 拉满
+- 修复：手动刷新与后台刷新互斥，不再叠加 git status 进程
+- 更新弹窗中文化（zh-Hans）
+
 ## [0.1.8] - 2026-11-10
 
 - 修复：fsnotify 事件风暴时并发 Snapshot 堆叠导致 fd 耗尽（refreshQuiet 节流）

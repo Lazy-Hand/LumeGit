@@ -55,11 +55,11 @@ type app struct {
 	histFilesW  float32 // history: file-list pane width
 	shelfListW  float32 // shelf: stash-list pane width
 	shelfFileW  float32 // shelf: file-list pane width
-	branchListW float32 // branches: list pane width
+	// (branchListW removed: the branches popup replaced the list pane)
 	diffSplit   float32
 	diffMode    int // 0 = split, 1 = unified
 
-	// Main tab: 0=提交, 1=历史, 2=搁置, 3=分支.
+	// Main tab: 0=提交, 1=历史, 2=搁置.
 	tab int
 
 	// Repo picker field.
@@ -312,10 +312,16 @@ func (a *app) openPickedRepo() {
 			}
 			a.commit.reconcileLists()
 			a.commit.ensureSelectedFile()
-			// File watching: the repo we just opened wins over any
-			// previous one.
-			a.commit.stopWatch()
-			a.commit.startWatch(w)
+			// Refs polling: the repo we just opened wins over any
+			// previous one. A fingerprint change invalidates the cached
+			// branch list so the popup shows fresh refs next open.
+			a.commit.stopPolling()
+			a.commit.lastFingerprint = ""
+			a.commit.onRefsChanged = func() {
+				a.branches.lastLoaded = ""
+				a.history.lastLoadedRepo = ""
+			}
+			a.commit.startPolling(w)
 		})
 	}()
 }
@@ -420,7 +426,7 @@ func (a *app) commitView(c *ui.Context, t *ui.Theme) {
 	ui.Column(c).Fill().Background(tk.BgLayout).Children(func() {
 		a.headerView(c, t)
 		ui.Row(c).Padding(4, 16).Background(tk.BgContainer).Children(func() {
-			action.Segmented(c, &a.tab, []string{"提交", "历史", "搁置", "分支"}, action.SegmentedProps{Size: theme.Small})
+			action.Segmented(c, &a.tab, []string{"提交", "历史", "搁置"}, action.SegmentedProps{Size: theme.Small})
 		})
 		if a.tab == 1 {
 			a.historyView(c, t)
@@ -428,10 +434,6 @@ func (a *app) commitView(c *ui.Context, t *ui.Theme) {
 		}
 		if a.tab == 2 {
 			a.shelfView(c, t)
-			return
-		}
-		if a.tab == 3 {
-			a.branchView(c, t)
 			return
 		}
 		ui.Split(c, &a.filesPaneW,
@@ -689,7 +691,10 @@ func (a *app) headerView(c *ui.Context, t *ui.Theme) {
 			if m.Snap.Unborn {
 				branch += " (未提交)"
 			}
-			display.Tag(c, branch, display.TagProps{Variant: display.TagOutlined, Color: display.TagInfo})
+			// IDEA Branches popup: clicking the current-branch tag opens the
+			// whole ref tree as a menu — checkout/merge/delete per branch.
+			display.Tag(c, branch, display.TagProps{Variant: display.TagOutlined, Color: display.TagInfo}).
+				Menu(func(mn *ui.Menu) { a.branchPopupMenu(mn) })
 			if m.Snap.Detached {
 				action.Button(c, "建分支", action.ButtonProps{Variant: action.Text, Size: theme.Small}).
 					OnClick(func() {
@@ -1985,117 +1990,251 @@ func stashFileKind(f *git.StashFile) git.FileKind {
 	return git.KindModified
 }
 
-// --- 分支（Branches）页 -----------------------------------------------
+// --- 分支（Branches）弹出菜单 -------------------------------------------
+//
+// IDEA 把分支树放在 header 分支名按钮的下拉菜单里，不是独立面板。
+// 每条本地/远程分支是一个 Submenu，项即原分支页的右键操作。
 
-// branchView: left branch tree, right actions on the selected branch.
-func (a *app) branchView(c *ui.Context, t *ui.Theme) {
+// branchPopupMenu builds the branches dropdown under the header tag.
+//
+// IDEA's Branches popup: New Branch/Tag on top, then local branches,
+// remote branches, tags, submodules and worktrees — every ref a submenu
+// holding the ops the old tab's context menu had.
+func (a *app) branchPopupMenu(mn *ui.Menu) {
 	m := &a.branches
-	m.ensureLoaded(a.commit.RepoPath, a.updater())
+	repoPath := a.commit.RepoPath
+	m.ensureLoaded(repoPath, a.updater())
 
-	ui.Split(c, &a.branchListW,
-		func() { a.branchListPane(c, t) },
-		func() { a.branchDetailPane(c, t) },
-	).Fill().Grow(1)
+	mn.MaxWidth(320)
+	if mn.Item("新建分支…").Chosen() {
+		a.newBranchFrom = ""
+		a.branchDialogKind = 2 // create + checkout
+		a.branchDialogOpen = true
+	}
+	if mn.Item("新建标签…").Chosen() {
+		m.tagOpen = true
+		m.tagName, m.tagTarget, m.tagMessage, m.tagErr = "", "", "", ""
+	}
+	if mn.Item("管理远程…").Chosen() {
+		m.remoteOpen = true
+		m.remoteErr = ""
+		m.remoteEdit = ""
+		m.remoteName, m.remoteURL = "", ""
+		m.loadRemotes(repoPath, a.updater())
+	}
+	if mn.Item("新建工作树…").Chosen() {
+		m.wtOpen = true
+		m.wtPath, m.wtRef, m.wtBranch, m.wtErr = "", "", "", ""
+	}
+	if mn.Item("刷新").Chosen() {
+		m.lastLoaded = ""
+		m.ensureLoaded(repoPath, a.updater())
+	}
+	mn.Separator()
+	if m.loading {
+		mn.Item("正在加载分支…").Disabled(true)
+		return
+	}
+	if m.err != "" {
+		mn.Item("加载失败：" + m.err).Disabled(true)
+	}
+	if len(m.local) == 0 && len(m.remote) == 0 && len(m.tags) == 0 {
+		mn.Item("（无分支）").Disabled(true)
+		return
+	}
+	// 本地分支
+	for i := range m.local {
+		b := m.local[i]
+		label := b.Name
+		if b.Current {
+			label = "✓ " + label
+		}
+		if b.HasTrack && (b.Ahead > 0 || b.Behind > 0) {
+			label += fmt.Sprintf("  +%d −%d", b.Ahead, b.Behind)
+		}
+		mn.Submenu(label, func(sub *ui.Menu) { a.localBranchMenu(sub, &b) })
+	}
+	if len(m.remote) > 0 {
+		mn.Separator()
+		mn.Submenu("远程分支", func(sub *ui.Menu) {
+			for i := range m.remote {
+				b := m.remote[i]
+				sub.Submenu(b.Name, func(s2 *ui.Menu) { a.remoteBranchMenu(s2, &b) })
+			}
+		})
+	}
+	if len(m.tags) > 0 {
+		mn.Separator()
+		mn.Submenu("标签", func(sub *ui.Menu) {
+			for i := range m.tags {
+				tg := m.tags[i]
+				sub.Submenu(tg.Name, func(s2 *ui.Menu) { a.tagMenu(s2, &tg) })
+			}
+		})
+	}
+	if len(m.submodules) > 0 {
+		mn.Separator()
+		mn.Submenu("子模块", func(sub *ui.Menu) {
+			for i := range m.submodules {
+				sm := m.submodules[i]
+				sub.Submenu(sm.Path, func(s2 *ui.Menu) { a.submoduleMenu(s2, &sm) })
+			}
+		})
+	}
+	if len(m.worktrees) > 0 {
+		mn.Separator()
+		mn.Submenu("工作树", func(sub *ui.Menu) {
+			for i := range m.worktrees {
+				wt := m.worktrees[i]
+				label := wt.Path
+				if wt.IsMain {
+					label += "（主）"
+				}
+				sub.Submenu(label, func(s2 *ui.Menu) { a.worktreeMenu(s2, &wt) })
+			}
+		})
+	}
 }
 
-// branchListPane: 本地/远程 grouped list + new-branch button.
-func (a *app) branchListPane(c *ui.Context, t *ui.Theme) {
+// localBranchMenu: ops on one local branch (checkout/merge/rebase/…).
+func (a *app) localBranchMenu(sub *ui.Menu, b *git.Branch) {
 	m := &a.branches
-	tk := theme.TokensOf(c)
-	ui.Column(c).Fill().Gap(0).Background(tk.BgContainer).Children(func() {
-		ui.Row(c).Padding(8, 12).Gap(8).AlignItems(ui.Center).Children(func() {
-			ui.Text(c, "分支").Bold()
-			// Spin while any branch query / mutation runs so refresh doesn't
-			// look dead (IDEA shows a spinner beside the toolbar too).
-			loading := m.loading || m.busy
-			feedback.Spin(c, feedback.SpinProps{Size: theme.Small, Spinning: &loading}, nil)
-			ui.Text(c, "").Grow(1)
-			action.Button(c, "+", action.ButtonProps{Variant: action.Text, Size: theme.Small}).
-				OnClick(func() { m.newOpen = !m.newOpen })
-			action.Button(c, "标签+", action.ButtonProps{Variant: action.Text, Size: theme.Small}).
-				OnClick(func() {
-					m.tagOpen = true
-					m.tagName, m.tagTarget, m.tagMessage, m.tagErr = "", "", "", ""
-				})
-			action.Button(c, "远程…", action.ButtonProps{Variant: action.Text, Size: theme.Small}).
-				OnClick(func() {
-					m.remoteOpen = true
-					m.remoteErr = ""
-					m.remoteEdit = ""
-					m.remoteName, m.remoteURL = "", ""
-					m.loadRemotes(a.commit.RepoPath, a.updater())
-				})
-			action.Button(c, "刷新", action.ButtonProps{Variant: action.Text, Size: theme.Small}).
-				Disabled(m.loading).OnClick(func() {
-				m.lastLoaded = ""
-				m.ensureLoaded(a.commit.RepoPath, a.updater())
-			})
-		})
-		if m.newOpen {
-			ui.Row(c).Padding(6, 12).Gap(8).Children(func() {
-				field.Input(c, &m.newName, field.InputProps{
-					Placeholder: "新分支名…", Size: theme.Small,
-				}).Grow(1).OnSubmit(a.createBranch)
-				action.Button(c, "创建", action.ButtonProps{Variant: action.Primary, Size: theme.Small}).
-					OnClick(a.createBranch)
-			})
+	repoPath := a.commit.RepoPath
+	name := b.Name
+	if !b.Current {
+		if sub.Item("切换到此分支").Chosen() {
+			m.op(repoPath, a.updater(), "正在切换…", "已切换",
+				func(r *git.Repo) (*git.RunResult, error) {
+					return r.Checkout(context.Background(), name, false)
+				},
+				func() { a.commit.refresh(appCTX, a.updater()) })
 		}
-		if m.err != "" {
-			ui.Column(c).Padding(6, 12).Children(func() {
-				feedback.Alert(c, m.err, feedback.AlertProps{Type: feedback.Error, Variant: feedback.Soft})
-			})
+	}
+	if sub.Item("合并到当前分支").Chosen() {
+		m.op(repoPath, a.updater(), "正在合并…", "已合并",
+			func(r *git.Repo) (*git.RunResult, error) {
+				return r.MergeIntoCurrent(context.Background(), name)
+			},
+			func() { a.commit.refresh(appCTX, a.updater()) })
+	}
+	if sub.Item("变基到此分支").Chosen() {
+		a.commit.rebase(appCTX, a.updater(), name)
+	}
+	sub.Separator()
+	if sub.Item("与当前分支比较").Chosen() {
+		a.cmpDiffState = nil
+		a.compare.openFor(repoPath, name, a.updater())
+	}
+	if sub.Item("与 'xxx' 比较…").Chosen() {
+		a.cmpDiffState = nil
+		a.branchCmpFrom = name
+		a.branchCmpOpen = true
+		a.branchCmpInput = ""
+	}
+	if sub.Item("重命名…").Chosen() {
+		m.renameOpen = true
+		m.renameOld = name
+		m.renameNew = name
+	}
+	sub.Separator()
+	if sub.Item("删除").Chosen() {
+		m.op(repoPath, a.updater(), "正在删除…", "已删除",
+			func(r *git.Repo) (*git.RunResult, error) {
+				return r.DeleteBranch(context.Background(), name, false)
+			}, nil)
+	}
+}
+
+// remoteBranchMenu: the one op remote branches support — track locally.
+func (a *app) remoteBranchMenu(sub *ui.Menu, b *git.Branch) {
+	m := &a.branches
+	repoPath := a.commit.RepoPath
+	name := b.Name
+	if sub.Item("从远程创建本地分支").Chosen() {
+		local := strings.TrimPrefix(name, "origin/")
+		m.op(repoPath, a.updater(), "正在创建…", "已创建",
+			func(r *git.Repo) (*git.RunResult, error) {
+				return r.RunOK(context.Background(), "switch", "-c", local, "--track", name)
+			},
+			func() { a.commit.refresh(appCTX, a.updater()) })
+	}
+}
+
+// tagMenu: checkout / push / delete for one tag.
+func (a *app) tagMenu(sub *ui.Menu, tg *git.Tag) {
+	m := &a.branches
+	repoPath := a.commit.RepoPath
+	name := tg.Name
+	if sub.Item("检出（分离 HEAD）").Chosen() {
+		m.op(repoPath, a.updater(), "正在检出…", "已检出",
+			func(r *git.Repo) (*git.RunResult, error) {
+				return r.CheckoutTag(context.Background(), name)
+			},
+			func() { a.commit.refresh(appCTX, a.updater()) })
+	}
+	if sub.Item("推送到远程").Chosen() {
+		m.op(repoPath, a.updater(), "正在推送…", "已推送",
+			func(r *git.Repo) (*git.RunResult, error) {
+				return r.PushTag(context.Background(), "origin", name)
+			}, nil)
+	}
+	sub.Separator()
+	if sub.Item("删除").Chosen() {
+		m.op(repoPath, a.updater(), "正在删除…", "已删除",
+			func(r *git.Repo) (*git.RunResult, error) {
+				return r.DeleteTag(context.Background(), name)
+			}, nil)
+	}
+}
+
+// submoduleMenu: init/update for one submodule.
+func (a *app) submoduleMenu(sub *ui.Menu, sm *git.Submodule) {
+	m := &a.branches
+	repoPath := a.commit.RepoPath
+	path := sm.Path
+	state := "未初始化"
+	if sm.Unmerged {
+		state = "冲突"
+	} else if sm.Init && sm.Dirty {
+		state = "已检出（有改动）"
+	} else if sm.Init {
+		state = "已检出"
+	}
+	sub.Item("状态：" + state).Disabled(true)
+	if !sm.Init || sm.Dirty {
+		if sub.Item("更新（init + checkout）").Chosen() {
+			m.op(repoPath, a.updater(), "正在更新子模块…", "已更新",
+				func(r *git.Repo) (*git.RunResult, error) {
+					return r.SubmoduleUpdate(context.Background(), path)
+				},
+				func() { a.commit.refresh(appCTX, a.updater()) })
 		}
-		if m.syncOK != "" {
-			ui.Row(c).Padding(4, 12).Children(func() {
-				display.Tag(c, "✓ "+m.syncOK, display.TagProps{Variant: display.TagBorderless, Color: display.TagSuccess})
-			})
-		}
-		switch {
-		case m.loading && len(m.local) == 0:
-			a.placeholder(c, t, "正在加载分支…")
-		default:
-			layout.ScrollArea(c, layout.ScrollAreaProps{}, func() {
-				ui.Column(c).FillWidth().Children(func() {
-					if len(m.local) > 0 {
-						a.branchSection(c, t, "本地", m.local, false)
-					}
-					if len(m.remote) > 0 {
-						a.branchSection(c, t, "远程", m.remote, true)
-					}
-					if len(m.tags) > 0 {
-						ui.Row(c).FillWidth().Padding(6, 14, 2, 14).Children(func() {
-							ui.Text(c, "标签").FontSize(11).Bold().TextColor(t.TextMuted)
-						})
-						for i := range m.tags {
-							a.tagRow(c, t, &m.tags[i])
-						}
-					}
-					if len(m.submodules) > 0 {
-						ui.Row(c).FillWidth().Padding(6, 14, 2, 14).Children(func() {
-							ui.Text(c, "子模块").FontSize(11).Bold().TextColor(t.TextMuted)
-						})
-						for i := range m.submodules {
-							a.submoduleRow(c, t, &m.submodules[i])
-						}
-					}
-					// 工作树（IDEA: Git → Manage Worktrees） — always show
-					// the section so the user can add linked checkouts.
-					ui.Row(c).FillWidth().Padding(6, 14, 2, 14).Gap(6).AlignItems(ui.Center).Children(func() {
-						ui.Text(c, "工作树").FontSize(11).Bold().TextColor(t.TextMuted)
-						ui.Text(c, "").Grow(1)
-						action.Button(c, "+", action.ButtonProps{Variant: action.Text, Size: theme.Small}).
-							OnClick(func() {
-								m.wtOpen = true
-								m.wtPath, m.wtRef, m.wtBranch, m.wtErr = "", "", "", ""
-							})
-					})
-					for i := range m.worktrees {
-						a.worktreeRow(c, t, &m.worktrees[i])
-					}
-				})
-			}).Grow(1)
-		}
-	})
+	}
+}
+
+// worktreeMenu: open-in-window / remove for one linked worktree.
+func (a *app) worktreeMenu(sub *ui.Menu, wt *git.Worktree) {
+	m := &a.branches
+	repoPath := a.commit.RepoPath
+	if !wt.IsMain && sub.Item("在新窗口打开此 worktree").Chosen() {
+		spawnWindow(wt.Path)
+	}
+	if wt.IsMain {
+		return
+	}
+	sub.Separator()
+	if sub.Item("移除").Chosen() {
+		m.op(repoPath, a.updater(), "正在移除 worktree…", "已移除",
+			func(r *git.Repo) (*git.RunResult, error) {
+				return r.RemoveWorktree(context.Background(), wt.Path, false)
+			}, nil)
+	}
+	if sub.Item("强制移除（丢弃改动）").Chosen() {
+		m.op(repoPath, a.updater(), "正在强制移除…", "已移除",
+			func(r *git.Repo) (*git.RunResult, error) {
+				return r.RemoveWorktree(context.Background(), wt.Path, true)
+			}, nil)
+	}
 }
 
 // createBranch makes + checks out a new local branch. The op's after
@@ -2124,248 +2263,8 @@ func (a *app) createBranch() {
 		func(r *git.Repo) (*git.RunResult, error) { return r.Checkout(context.Background(), name, true) },
 		func() {
 			m.newName = ""
-			m.newOpen = false
 			a.commit.refresh(appCTX, a.updater()) // HEAD moved
 		})
-}
-
-// branchSection renders one group header + rows.
-func (a *app) branchSection(c *ui.Context, t *ui.Theme, title string, bs []git.Branch, remote bool) {
-	ui.Row(c).FillWidth().Padding(6, 14, 2, 14).Children(func() {
-		ui.Text(c, title).FontSize(11).Bold().TextColor(t.TextMuted)
-	})
-	for i := range bs {
-		a.branchRow(c, t, &bs[i], remote)
-	}
-}
-
-// branchRow: one ref + context actions.
-func (a *app) branchRow(c *ui.Context, t *ui.Theme, b *git.Branch, remote bool) {
-	m := &a.branches
-	sel := m.selected == b.Name && m.isRemote == remote
-	repoPath := a.commit.RepoPath
-	name := b.Name
-	rowEl := ui.Row(c).Key("br-"+name).FillWidth().Padding(6, 14).Gap(8).AlignItems(ui.Center).
-		Background(rowBg(t, sel))
-	rowEl.Children(func() {
-		label := name
-		if remote {
-			label = "🌐 " + name
-		}
-		if b.Current {
-			ui.Text(c, label).Bold().TextColor(t.Accent)
-		} else {
-			ui.Text(c, label)
-		}
-		ui.Text(c, "").Grow(1)
-		if b.HasTrack && (b.Ahead > 0 || b.Behind > 0) {
-			display.Tag(c, fmt.Sprintf("+%d −%d", b.Ahead, b.Behind),
-				display.TagProps{Variant: display.TagBorderless})
-		}
-	})
-	rowEl.OnClick(func() {
-		m.selected = name
-		m.isRemote = remote
-		m.isTag = false
-	})
-	rowEl.ContextMenu(func(mn *ui.Menu) {
-		if remote {
-			if mn.Item("从远程创建本地分支").Chosen() {
-				local := strings.TrimPrefix(name, "origin/")
-				m.op(repoPath, a.updater(), "正在创建…", "已创建",
-					func(r *git.Repo) (*git.RunResult, error) {
-						return r.RunOK(context.Background(), "switch", "-c", local, "--track", name)
-					},
-					func() { a.commit.refresh(appCTX, a.updater()) })
-			}
-			return
-		}
-		if !b.Current {
-			if mn.Item("切换到此分支").Chosen() {
-				m.op(repoPath, a.updater(), "正在切换…", "已切换",
-					func(r *git.Repo) (*git.RunResult, error) {
-						return r.Checkout(context.Background(), name, false)
-					},
-					func() { a.commit.refresh(appCTX, a.updater()) })
-			}
-		}
-		if mn.Item("合并到当前分支").Chosen() {
-			m.op(repoPath, a.updater(), "正在合并…", "已合并",
-				func(r *git.Repo) (*git.RunResult, error) {
-					return r.MergeIntoCurrent(context.Background(), name)
-				},
-				func() { a.commit.refresh(appCTX, a.updater()) })
-		}
-		if mn.Item("变基到此分支").Chosen() {
-			a.commit.rebase(appCTX, a.updater(), name)
-		}
-		mn.Separator()
-		if mn.Item("与当前分支比较").Chosen() {
-			a.cmpDiffState = nil
-			a.compare.openFor(repoPath, name, a.updater())
-		}
-		// Two-branch compare: pick a second ref.
-		if mn.Item("与 'xxx' 比较…").Chosen() {
-			a.cmpDiffState = nil
-			a.branchCmpFrom = name
-			a.branchCmpOpen = true
-			a.branchCmpInput = ""
-		}
-		if mn.Item("重命名…").Chosen() {
-			m.renameOpen = true
-			m.renameOld = name
-			m.renameNew = name
-		}
-		mn.Separator()
-		if mn.Item("删除").Chosen() {
-			m.op(repoPath, a.updater(), "正在删除…", "已删除",
-				func(r *git.Repo) (*git.RunResult, error) {
-					return r.DeleteBranch(context.Background(), name, false)
-				}, nil)
-		}
-	})
-}
-
-// branchDetailPane: info + actions for the selected branch or tag.
-func (a *app) branchDetailPane(c *ui.Context, t *ui.Theme) {
-	m := &a.branches
-	tk := theme.TokensOf(c)
-	ui.Column(c).Fill().Padding(24).Gap(12).Background(tk.BgLayout).Children(func() {
-		if m.isTag {
-			a.tagDetailPane(c, t)
-			return
-		}
-		var sel *git.Branch
-		if m.isRemote {
-			for i := range m.remote {
-				if m.remote[i].Name == m.selected {
-					sel = &m.remote[i]
-				}
-			}
-		} else {
-			for i := range m.local {
-				if m.local[i].Name == m.selected {
-					sel = &m.local[i]
-				}
-			}
-		}
-		if sel == nil {
-			a.placeholder(c, t, "选择左侧分支。")
-			return
-		}
-		ui.Text(c, sel.Name).FontSize(18).Bold()
-		ui.Text(c, sel.OID).FontSize(12).TextColor(t.TextMuted)
-		if sel.Upstream != "" {
-			ui.Text(c, "上游："+sel.Upstream).TextColor(t.TextMuted)
-		}
-		ui.Row(c).Gap(8).Children(func() {
-			if !sel.Current && !sel.Remote {
-				action.Button(c, "切换", action.ButtonProps{Variant: action.Primary, Size: theme.Middle}).
-					OnClick(func() {
-						m.op(a.commit.RepoPath, a.updater(), "正在切换…", "已切换",
-							func(r *git.Repo) (*git.RunResult, error) {
-								return r.Checkout(context.Background(), sel.Name, false)
-							},
-							func() { a.commit.refresh(appCTX, a.updater()) })
-					})
-			}
-			if !sel.Remote {
-				action.Button(c, "合并到当前分支", action.ButtonProps{Variant: action.Default, Size: theme.Middle}).
-					OnClick(func() {
-						m.op(a.commit.RepoPath, a.updater(), "正在合并…", "已合并",
-							func(r *git.Repo) (*git.RunResult, error) {
-								return r.MergeIntoCurrent(context.Background(), sel.Name)
-							},
-							func() { a.commit.refresh(appCTX, a.updater()) })
-					})
-			}
-		})
-	})
-}
-
-// submoduleRow: one submodule + update action.
-func (a *app) submoduleRow(c *ui.Context, t *ui.Theme, sm *git.Submodule) {
-	m := &a.branches
-	repoPath := a.commit.RepoPath
-	path := sm.Path
-	rowEl := ui.Row(c).Key("sub-"+path).FillWidth().Padding(6, 14).Gap(8).AlignItems(ui.Center)
-	rowEl.Children(func() {
-		ui.Column(c).Grow(1).Gap(1).Children(func() {
-			ui.Text(c, path).FontSize(12)
-			ui.Row(c).Gap(6).Children(func() {
-				state := "未初始化"
-				color := display.TagGray
-				if sm.Unmerged {
-					state = "冲突"
-					color = display.TagError
-				} else if sm.Init && sm.Dirty {
-					state = "已检出（有改动）"
-					color = display.TagWarning
-				} else if sm.Init {
-					state = "已检出 " + sm.OID[:7]
-					color = display.TagSuccess
-				}
-				display.Tag(c, state, display.TagProps{Variant: display.TagBorderless, Color: color})
-			})
-		})
-	})
-	if !sm.Init || sm.Dirty {
-		rowEl.ContextMenu(func(mn *ui.Menu) {
-			if mn.Item("更新（init + checkout）").Chosen() {
-				m.op(repoPath, a.updater(), "正在更新子模块…", "已更新",
-					func(r *git.Repo) (*git.RunResult, error) {
-						return r.SubmoduleUpdate(context.Background(), path)
-					},
-					func() { a.commit.refresh(appCTX, a.updater()) })
-			}
-		})
-	}
-}
-
-// worktreeRow: one linked worktree entry (IDEA: Manage Worktrees row).
-func (a *app) worktreeRow(c *ui.Context, t *ui.Theme, wt *git.Worktree) {
-	m := &a.branches
-	repoPath := a.commit.RepoPath
-	rowEl := ui.Row(c).Key("wt-"+wt.Path).FillWidth().Padding(6, 14).Gap(8).AlignItems(ui.Center)
-	rowEl.Children(func() {
-		ui.Column(c).Grow(1).Gap(1).Children(func() {
-			label := wt.Path
-			if wt.IsMain {
-				label += "  (主)"
-			}
-			ui.Text(c, label).FontSize(12).SingleLine()
-			ui.Row(c).Gap(6).Children(func() {
-				desc := wt.Branch
-				if wt.Detached {
-					desc = "DETACHED @ " + shortOID(wt.OID)
-				}
-				if desc == "" {
-					desc = shortOID(wt.OID)
-				}
-				ui.Text(c, desc).FontSize(11).TextColor(t.TextMuted)
-			})
-		})
-	})
-	if !wt.IsMain {
-		rowEl.ContextMenu(func(mn *ui.Menu) {
-			if mn.Item("在新窗口打开此 worktree").Chosen() {
-				spawnWindow(wt.Path)
-			}
-			mn.Separator()
-			if mn.Item("移除").Chosen() {
-				m.op(repoPath, a.updater(), "正在移除 worktree…", "已移除",
-					func(r *git.Repo) (*git.RunResult, error) {
-						return r.RemoveWorktree(context.Background(), wt.Path, false)
-					}, nil)
-			}
-			if mn.Item("强制移除（丢弃改动）").Chosen() {
-				m.op(repoPath, a.updater(), "正在强制移除…", "已移除",
-					func(r *git.Repo) (*git.RunResult, error) {
-						return r.RemoveWorktree(context.Background(), wt.Path, true)
-					}, nil)
-			}
-		})
-	}
 }
 
 // worktreeDialog collects path + ref + optional new-branch for
@@ -2424,100 +2323,6 @@ func (a *app) confirmWorktree() bool {
 			m.wtErr = ""
 		})
 	return true
-}
-
-// tagRow: one local tag — IDEA shows tags as their own group.
-func (a *app) tagRow(c *ui.Context, t *ui.Theme, tg *git.Tag) {
-	m := &a.branches
-	sel := m.isTag && m.selTag == tg.Name
-	repoPath := a.commit.RepoPath
-	name := tg.Name
-	rowEl := ui.Row(c).Key("tag-"+name).FillWidth().Padding(6, 14).Gap(8).AlignItems(ui.Center).
-		Background(rowBg(t, sel))
-	rowEl.Children(func() {
-		ui.Text(c, "🏷 "+name)
-		ui.Text(c, "").Grow(1)
-		if tg.Annotated {
-			display.Tag(c, "附注", display.TagProps{Variant: display.TagBorderless})
-		}
-	})
-	rowEl.OnClick(func() {
-		m.isTag = true
-		m.selTag = name
-	})
-	rowEl.ContextMenu(func(mn *ui.Menu) {
-		if mn.Item("检出（分离 HEAD）").Chosen() {
-			m.op(repoPath, a.updater(), "正在检出…", "已检出",
-				func(r *git.Repo) (*git.RunResult, error) {
-					return r.CheckoutTag(context.Background(), name)
-				},
-				func() { a.commit.refresh(appCTX, a.updater()) })
-		}
-		if mn.Item("推送到远程").Chosen() {
-			m.op(repoPath, a.updater(), "正在推送…", "已推送",
-				func(r *git.Repo) (*git.RunResult, error) {
-					return r.PushTag(context.Background(), "origin", name)
-				}, nil)
-		}
-		mn.Separator()
-		if mn.Item("删除").Chosen() {
-			m.op(repoPath, a.updater(), "正在删除…", "已删除",
-				func(r *git.Repo) (*git.RunResult, error) {
-					return r.DeleteTag(context.Background(), name)
-				}, nil)
-		}
-	})
-}
-
-// tagDetailPane: selected tag's info + actions.
-func (a *app) tagDetailPane(c *ui.Context, t *ui.Theme) {
-	m := &a.branches
-	var sel *git.Tag
-	for i := range m.tags {
-		if m.tags[i].Name == m.selTag {
-			sel = &m.tags[i]
-		}
-	}
-	if sel == nil {
-		a.placeholder(c, t, "选择左侧标签。")
-		return
-	}
-	ui.Text(c, sel.Name).FontSize(18).Bold()
-	ui.Text(c, sel.OID).FontSize(12).TextColor(t.TextMuted)
-	if sel.Annotated {
-		ui.Text(c, "附注标签").TextColor(t.TextMuted)
-		if sel.Message != "" {
-			ui.Text(c, sel.Message).TextColor(t.TextMuted)
-		}
-	} else {
-		ui.Text(c, "轻量标签").TextColor(t.TextMuted)
-	}
-	repoPath := a.commit.RepoPath
-	name := sel.Name
-	ui.Row(c).Gap(8).Children(func() {
-		action.Button(c, "检出", action.ButtonProps{Variant: action.Default, Size: theme.Middle}).
-			OnClick(func() {
-				m.op(repoPath, a.updater(), "正在检出…", "已检出",
-					func(r *git.Repo) (*git.RunResult, error) {
-						return r.CheckoutTag(context.Background(), name)
-					},
-					func() { a.commit.refresh(appCTX, a.updater()) })
-			})
-		action.Button(c, "推送到远程", action.ButtonProps{Variant: action.Default, Size: theme.Middle}).
-			OnClick(func() {
-				m.op(repoPath, a.updater(), "正在推送…", "已推送",
-					func(r *git.Repo) (*git.RunResult, error) {
-						return r.PushTag(context.Background(), "origin", name)
-					}, nil)
-			})
-		action.Button(c, "删除", action.ButtonProps{Variant: action.Default, Size: theme.Middle}).
-			OnClick(func() {
-				m.op(repoPath, a.updater(), "正在删除…", "已删除",
-					func(r *git.Repo) (*git.RunResult, error) {
-						return r.DeleteTag(context.Background(), name)
-					}, nil)
-			})
-	})
 }
 
 // tagDialog collects a new tag's name/target/message (IDEA: New Tag…).
@@ -3272,7 +3077,6 @@ func (a *app) doRenameBranch() {
 		},
 		func() {
 			m.renameOpen = false
-			m.selected = newName
 			a.commit.refresh(appCTX, a.updater()) // current branch may have been renamed
 		})
 }
@@ -3621,10 +3425,13 @@ func (a *app) branchDialog(c *ui.Context, t *ui.Theme) {
 	title := "新建分支"
 	okText := "创建"
 	hint := "从 " + shortOID(a.newBranchFrom) + " 创建分支"
-	if a.branchDialogKind == 1 {
+	switch a.branchDialogKind {
+	case 1:
 		title = "变基到目标"
 		okText = "变基"
 		hint = "目标分支或提交"
+	case 2:
+		hint = "创建并切换到新分支"
 	}
 	if feedback.Modal(c, &a.branchDialogOpen, feedback.ModalProps{
 		Title: title, Width: 420, OkText: okText,
@@ -3650,6 +3457,9 @@ func (a *app) confirmBranchDialog() bool {
 	switch a.branchDialogKind {
 	case 1: // rebase
 		a.commit.rebase(appCTX, a.updater(), name)
+	case 2: // create + checkout (IDEA: New Branch in the branches popup)
+		a.branches.newName = name
+		a.createBranch()
 	default: // new branch from commit
 		from := a.newBranchFrom
 		a.commit.runOp(appCTX, a.updater(), "正在创建分支…", "已创建",

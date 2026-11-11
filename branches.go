@@ -16,16 +16,12 @@ type branchModel struct {
 	worktrees  []git.Worktree
 	loading    bool
 	err        string
-	selected   string // branch name
-	isRemote   bool
-	selTag     string // selected tag name (when selected == selTag and isTag)
-	isTag      bool
 	busy       bool
 	syncOK     string
 	lastLoaded string
 
-	// New-branch form.
-	newOpen bool
+	// New-branch name staging (popup menu → confirmBranchDialog kind=2 →
+	// createBranch reads it).
 	newName string
 
 	// New-tag dialog.
@@ -233,9 +229,6 @@ func (b *branchModel) remoteOp(repoPath string, w updater,
 func (b *branchModel) reset() {
 	b.local, b.remote = nil, nil
 	b.tags = nil
-	b.selected = ""
-	b.isTag = false
-	b.selTag = ""
 	b.lastLoaded = ""
 	b.err = ""
 	b.gen++

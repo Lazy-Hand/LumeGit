@@ -53,7 +53,11 @@ func main() {
 	// Sparkle-style update window: background daily check + "检查更新…"
 	// menu item. Dev builds skip; the plugin no-ops when the build can't
 	// update itself.
-	mygo.Use(updaterui.Plugin)
+	// The updater window is forced to simplified Chinese: LumeGit's own UI
+	// is Chinese-only, so following the system locale (which App.Locale
+	// resolves to "en" while the app declares no localizations) would
+	// show an English dialog inside a Chinese app.
+	mygo.Use(updaterui.New(upd.Options{Language: "zh-Hans"}))
 
 	mygo.App.WhenReady(func() {
 		mygo.App.SetMenu(mygo.NewMenu([]*mygo.MenuItem{
@@ -100,7 +104,6 @@ func spawnWindow(openPath string) {
 	a.histFilesW = 260
 	a.shelfListW = 300
 	a.shelfFileW = 240
-	a.branchListW = 320
 	a.commit.repos = sharedRepos()
 	if openPath != "" {
 		a.pickPath = openPath
@@ -129,11 +132,19 @@ func spawnWindow(openPath string) {
 	a.winUpdate = win.Update
 	a.commit.publish = win.Update
 
+	// Window focus = "user is back" — lazygit/GitHub Desktop pattern:
+	// refresh immediately so external changes (a commit made in the
+	// terminal while we were unfocused) are already loaded. Quiet, so
+	// the banner doesn't flash on every ⌘Tab.
+	win.OnFocus(func() {
+		a.commit.refreshQuiet(context.Background(), a.updater())
+	})
+
 	win.OnClosed(func() {
-		// Per-window cleanup only: stop its fs watcher and in-flight git
+		// Per-window cleanup only: stop its refs poller and in-flight git
 		// work. appCTX / appCancel belong to the process and outlive any
 		// one window; the shared repos store is left alone too.
-		a.commit.stopWatch()
+		a.commit.stopPolling()
 		if a.commit.deadCtx != nil {
 			a.commit.deadCtx()
 		}

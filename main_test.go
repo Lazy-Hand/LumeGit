@@ -200,27 +200,38 @@ func TestShelfViewRenders(t *testing.T) {
 	}
 }
 
-// TestBranchViewRenders populates the branch model and checks the
-// branches tab builds headlessly.
-func TestBranchViewRenders(t *testing.T) {
+// TestBranchPopupMenu populates the branch model and checks the header
+// tag's dropdown (IDEA Branches popup) lists the refs headlessly.
+func TestBranchPopupMenu(t *testing.T) {
 	a := &app{}
 	a.commit.RepoPath = "/fake/repo"
 	a.commit.Snap = fakeSnapshot(t)
 	a.commit.publish = func(fn func()) { fn() }
-	a.tab = 3
-	a.branchListW = 320
 	a.branches.lastLoaded = "/fake/repo"
 	a.branches.local = []git.Branch{
 		{Name: "main", Current: true, OID: "abc1234", Upstream: "origin/main", HasTrack: true},
 		{Name: "feature", OID: "def5678"},
 	}
 	a.branches.remote = []git.Branch{{Name: "origin/main", OID: "abc1234", Remote: true}}
+	a.branches.tags = []git.Tag{{Name: "v1.0", OID: "abc1234"}}
 	tt := ui.NewTester(a.view, 1280, 720)
-	for _, want := range []string{"分支", "本地", "远程", "main", "feature", "origin/main"} {
-		if !tt.HasText(want) {
-			t.Errorf("text %q missing: %q", want, tt.Texts())
+	if err := tt.ClickWith(0, "main"); err != nil {
+		t.Fatalf("click branch tag: %v", err)
+	}
+	menu := tt.Menu()
+	for _, want := range []string{"新建分支…", "新建标签…", "✓ main", "feature", "远程分支", "标签"} {
+		found := false
+		for _, item := range menu {
+			if item == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("menu item %q missing: %v", want, menu)
 		}
 	}
+	tt.CloseMenu()
 }
 
 // TestFilesPaneScrolls guards the Grow(1) fix: the file list's ScrollArea
