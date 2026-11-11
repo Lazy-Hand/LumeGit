@@ -30,10 +30,15 @@ var inProgressStates = map[string]string{
 // time, not a transaction over HEAD+index+worktree. Operations that
 // change state must re-verify against a fresh snapshot before acting.
 func (r *Repo) Snapshot(ctx context.Context) (*Snapshot, error) {
-	// -uall lists untracked files individually. The default collapses a
-	// fully-untracked directory to one "dir/" record, which shows up in
-	// the UI as a fake file that has no diffable content.
-	res, err := r.RunOK(ctx, "status", "--porcelain=v2", "-z", "--branch", "-uall")
+	// -uall lists untracked files individually; -uno reports only the
+	// directory. PreferNoUntracked picks the cheap mode for repos whose
+	// untracked set is large enough that enumerating it dominates the
+	// refresh cost.
+	untracked := "-uall"
+	if r.PreferNoUntracked {
+		untracked = "-uno"
+	}
+	res, err := r.RunOK(ctx, "status", "--porcelain=v2", "-z", "--branch", untracked)
 	if err != nil {
 		return nil, err
 	}
@@ -103,6 +108,20 @@ func detectInProgress(ctx context.Context, r *Repo) string {
 		return "am"
 	}
 	return ""
+}
+
+// EnableFSMonitor turns on git's builtin filesystem monitor
+// (core.fsmonitor=true), which lets `git status` reuse a daemon's file
+// cache instead of stat()ing every file. Fork measured 600ms→50ms on a
+// typical repo and 5000ms→1000ms on Chromium. Git <2.36 lacks the
+// feature; older versions just fail the config write and we ignore it.
+// Idempotent: safe to call on every open.
+func (r *Repo) EnableFSMonitor(ctx context.Context) {
+	maj, min, err := r.gitVersion(ctx)
+	if err != nil || maj < 2 || (maj == 2 && min < 36) {
+		return
+	}
+	_, _ = r.Run(ctx, "config", "core.fsmonitor", "true")
 }
 
 // HeadResolution returns the symbolic name and OID of HEAD. Used by the

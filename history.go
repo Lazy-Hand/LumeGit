@@ -17,6 +17,11 @@ type historyModel struct {
 	err        string
 	selectedID string // OID of the highlighted commit
 
+	// Pagination: pageSize commits per fetch; hasMore when the last page
+	// came back full (IDEA lazy-loads the log on scroll).
+	pageSize int
+	hasMore  bool
+
 	// File list of the selected commit.
 	files        []git.CommitFile
 	filesLoading bool
@@ -27,6 +32,7 @@ type historyModel struct {
 	diff        *git.DiffInfo
 	diffLoading bool
 	diffErr     string
+	diffCancel  context.CancelFunc // cancels an in-flight diff read
 
 	// gen fences stale async results after a repo switch or refresh.
 	gen int
@@ -78,6 +84,9 @@ func (h *historyModel) load(repoPath string, w updater) {
 	h.err = ""
 	h.filterActive = h.filterBranch != "" || h.filterAuthor != "" ||
 		h.filterGrep != "" || h.filterPath != "" || h.filterAll
+	if h.pageSize == 0 {
+		h.pageSize = 50
+	}
 	go func() {
 		repo := git.NewRepo(repoPath)
 		type logResult struct {
@@ -87,8 +96,9 @@ func (h *historyModel) load(repoPath string, w updater) {
 		logCh := make(chan logResult, 1)
 		unpushedCh := make(chan map[string]bool, 1)
 		go func() {
+			// Ask for one extra row so we know whether a next page exists.
 			commits, err := repo.LogFiltered(context.Background(), git.LogOptions{
-				Max:    300,
+				Max:    h.pageSize + 1,
 				Branch: h.filterBranch,
 				Author: h.filterAuthor,
 				Grep:   h.filterGrep,
@@ -116,10 +126,54 @@ func (h *historyModel) load(repoPath string, w updater) {
 				return
 			}
 			h.err = ""
+			h.hasMore = len(lr.commits) > h.pageSize
+			if h.hasMore {
+				lr.commits = lr.commits[:h.pageSize]
+			}
 			h.commits = lr.commits
 			h.graph = git.BuildGraph(lr.commits)
 			h.unpushed = unpushed
 			h.ensureSelection(repoPath, w)
+		})
+	}()
+}
+
+// loadMore appends the next page of commits (IDEA: scrolling the log to
+// the bottom fetches older entries). No-op while a load is running or
+// when the last page came back short.
+func (h *historyModel) loadMore(repoPath string, w updater) {
+	if repoPath == "" || h.loading || !h.hasMore || len(h.commits) == 0 {
+		return
+	}
+	h.loading = true
+	gen := h.gen
+	skip := len(h.commits)
+	go func() {
+		repo := git.NewRepo(repoPath)
+		commits, err := repo.LogFiltered(context.Background(), git.LogOptions{
+			Max:    h.pageSize + 1,
+			Skip:   skip,
+			Branch: h.filterBranch,
+			Author: h.filterAuthor,
+			Grep:   h.filterGrep,
+			Path:   h.filterPath,
+			All:    h.filterAll,
+		})
+		w.update(func() {
+			if gen != h.gen {
+				return
+			}
+			h.loading = false
+			if err != nil {
+				h.err = err.Error()
+				return
+			}
+			h.hasMore = len(commits) > h.pageSize
+			if h.hasMore {
+				commits = commits[:h.pageSize]
+			}
+			h.commits = append(h.commits, commits...)
+			h.graph = git.BuildGraph(h.commits)
 		})
 	}()
 }
@@ -175,21 +229,31 @@ func (h *historyModel) selectCommit(repoPath, oid string, w updater) {
 	}()
 }
 
-// selectCommitFile records the file pick and loads its diff.
+// selectCommitFile records the file pick and loads its diff. Selecting
+// another file cancels the previous read — a big diff no longer burns
+// CPU producing output nobody will see.
 func (h *historyModel) selectCommitFile(repoPath, oid string, f git.CommitFile, w updater) {
+	if h.diffCancel != nil {
+		h.diffCancel()
+		h.diffCancel = nil
+	}
 	h.selectedFile = f.Path
 	h.diff = nil
 	h.diffErr = ""
 	h.diffLoading = true
 	gen := h.gen
+	ctx, cancel := context.WithCancel(context.Background())
+	h.diffCancel = cancel
 	go func() {
 		repo := git.NewRepo(repoPath)
-		d, err := repo.CommitFileDiff(context.Background(), oid, f)
+		d, err := repo.CommitFileDiff(ctx, oid, f)
 		w.update(func() {
+			cancel()
 			if gen != h.gen || h.selectedID != oid || h.selectedFile != f.Path {
 				return
 			}
 			h.diffLoading = false
+			h.diffCancel = nil
 			if err != nil {
 				h.diffErr = err.Error()
 				return

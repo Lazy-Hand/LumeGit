@@ -137,6 +137,18 @@ type commitModel struct {
 	// change — windows use it to invalidate cached branch/tag lists.
 	onRefsChanged func()
 
+	// preferNoUntracked switches `git status` to -uno once we've seen an
+	// untracked flood (VSCode's huge-repo degradation). Sticky per repo
+	// for this window; the flag persists on the model, not the Repo, so
+	// it survives across the per-call NewRepo instances.
+	preferNoUntracked bool
+
+	// isActive, when set, reports whether the window is focused. The
+	// poller polls at 2s while focused and backs off to 10s unfocused —
+	// nobody reads a window they can't see (lazygit's RefreshInterval
+	// is 10s by default anyway).
+	isActive func() bool
+
 	// pushDlg backs the Push confirmation dialog (IDEA: push preview).
 	pushDlg pushDialog
 
@@ -355,6 +367,9 @@ func openRepo(ctx context.Context, dir string) (*git.Snapshot, string, error) {
 	if err != nil {
 		return nil, "", err
 	}
+	// Warm git's own file cache for this repo — cheap, idempotent, and
+	// every subsequent `status` gets faster.
+	repo.EnableFSMonitor(ctx)
 	snap, err := repo.Snapshot(ctx)
 	if err != nil {
 		return nil, repo.Worktree, err
@@ -376,8 +391,10 @@ func (m *commitModel) refresh(ctx context.Context, w updater) {
 	m.refreshRunning = true
 	gen := m.gen
 	m.setBusy(w, true, "正在获取状态…")
+	noUntracked := m.preferNoUntracked
 	go func() {
 		repo := git.NewRepo(m.RepoPath)
+		repo.PreferNoUntracked = noUntracked
 		snap, err := repo.Snapshot(ctx)
 		w.update(func() {
 			m.refreshRunning = false
@@ -391,12 +408,32 @@ func (m *commitModel) refresh(ctx context.Context, w updater) {
 			} else {
 				m.lastErr = ""
 				m.Snap = snap
+				m.checkUntrackedFlood()
 				m.reconcileLists()
 				m.pruneChecked()
 				m.ensureSelectedFile()
 			}
 		})
 	}()
+}
+
+// checkUntrackedFlood counts untracked entries in the snapshot; past
+// the threshold the next refresh switches to -uno (cheap mode). Runs
+// on the UI thread.
+func (m *commitModel) checkUntrackedFlood() {
+	if m.preferNoUntracked || m.Snap == nil {
+		return
+	}
+	n := 0
+	for _, f := range m.Snap.Files {
+		if f.Kind == git.KindUntracked {
+			n++
+		}
+	}
+	const hugeUntracked = 2000
+	if n > hugeUntracked {
+		m.preferNoUntracked = true
+	}
 }
 
 // refreshQuiet is refresh without the busy banner — background triggers
@@ -411,8 +448,10 @@ func (m *commitModel) refreshQuiet(ctx context.Context, w updater) {
 	}
 	m.refreshRunning = true
 	gen := m.gen
+	noUntracked := m.preferNoUntracked
 	go func() {
 		repo := git.NewRepo(m.RepoPath)
+		repo.PreferNoUntracked = noUntracked
 		snap, err := repo.Snapshot(ctx)
 		w.update(func() {
 			m.refreshRunning = false
@@ -425,6 +464,7 @@ func (m *commitModel) refreshQuiet(ctx context.Context, w updater) {
 			} else {
 				m.lastErr = ""
 				m.Snap = snap
+				m.checkUntrackedFlood()
 				m.reconcileLists()
 				m.pruneChecked()
 				m.ensureSelectedFile()
@@ -446,13 +486,24 @@ func (m *commitModel) startPolling(w updater) {
 	m.pollCancel = cancel
 	repoPath := m.RepoPath
 	go func() {
-		ticker := time.NewTicker(2 * time.Second)
+		interval := 2 * time.Second
+		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
+				// Adaptive: 2s focused, 10s background.
+				want := 2 * time.Second
+				if m.isActive != nil && !m.isActive() {
+					want = 10 * time.Second
+				}
+				if want != interval {
+					interval = want
+					ticker.Reset(interval)
+					continue
+				}
 				repo := git.NewRepo(repoPath)
 				fp, err := repo.RefsFingerprint(ctx)
 				if err != nil {

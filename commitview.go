@@ -321,7 +321,16 @@ func (a *app) openPickedRepo() {
 				a.branches.lastLoaded = ""
 				a.history.lastLoadedRepo = ""
 			}
+			if a.win != nil {
+				a.commit.isActive = a.win.IsFocused
+			}
 			a.commit.startPolling(w)
+			// Warm the other tabs' caches: each loader spawns its own
+			// worker and returns at once, so the three git reads run
+			// concurrently while the UI is already showing 提交.
+			a.history.ensureLoaded(worktree, w)
+			a.shelf.ensureLoaded(worktree, w)
+			a.branches.ensureLoaded(worktree, w)
 		})
 	}()
 }
@@ -1473,6 +1482,18 @@ func (a *app) commitListPane(c *ui.Context, t *ui.Theme) {
 							gl = &m.graph[i]
 						}
 						a.commitRowView(c, t, &m.commits[i], gl)
+					}
+					// IDEA lazy-loads on scroll-to-bottom; a button is the
+					// explicit affordance and keeps the row count testable.
+					if m.hasMore {
+						ui.Row(c).FillWidth().Padding(6, 14).Children(func() {
+							if m.loading {
+								ui.Text(c, "正在加载…").FontSize(11).TextColor(t.TextMuted)
+							} else {
+								action.Button(c, "加载更多提交…", action.ButtonProps{Variant: action.Text, Size: theme.Small}).
+									OnClick(func() { m.loadMore(a.commit.RepoPath, a.updater()) })
+							}
+						})
 					}
 				})
 			}).Grow(1)

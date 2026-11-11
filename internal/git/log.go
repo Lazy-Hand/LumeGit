@@ -75,6 +75,7 @@ const logFields = "%H%x1f%h%x1f%P%x1f%an%x1f%ae%x1f%aI%x1f%s%x1f%D%x1f%G?%x1e"
 // LogOptions filters the history (IDEA's log filter bar).
 type LogOptions struct {
 	Max    int    // -n
+	Skip   int    // --skip: page offset for lazy loading
 	Branch string // rev to walk (empty = HEAD); also accepts tag/commit
 	Author string // --author substring
 	Grep   string // --grep (commit message, case-insensitive)
@@ -91,6 +92,9 @@ func (r *Repo) LogFiltered(ctx context.Context, o LogOptions) ([]Commit, error) 
 	args := []string{"log", "--format=" + logFields}
 	if o.Max > 0 {
 		args = append(args, "-n", strconv.Itoa(o.Max))
+	}
+	if o.Skip > 0 {
+		args = append(args, "--skip", strconv.Itoa(o.Skip))
 	}
 	if o.Author != "" {
 		args = append(args, "--author="+o.Author)

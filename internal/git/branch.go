@@ -29,9 +29,13 @@ func (r *Repo) RefsAll(ctx context.Context) (local, remote []Branch, tags []Tag,
 	// detect it via `symbolic-ref HEAD` (cheap, single call).
 	//
 	// Format per record:  shortname US refname US oid US objtype US
-	// upstream US trackshort US subject RS
+	// upstream US track US trackshort US subject RS
+	//
+	// %(upstream:track) gives "[ahead N, behind M]" in one shot — the
+	// exact counts the branch popup shows — while trackshort alone only
+	// has glyphs. One for-each-ref beats per-branch rev-list calls.
 	res, err := r.Run(ctx, "for-each-ref",
-		"--format=%(refname:short)%1f%(refname)%1f%(objectname:short)%1f%(objecttype)%1f%(upstream:short)%1f%(upstream:trackshort)%1f%(subject)%1e",
+		"--format=%(refname:short)%1f%(refname)%1f%(objectname:short)%1f%(objecttype)%1f%(upstream:short)%1f%(upstream:track)%1f%(upstream:trackshort)%1f%(subject)%1e",
 		"refs/heads", "refs/remotes", "refs/tags")
 	if err != nil {
 		return nil, nil, nil, err
@@ -46,18 +50,21 @@ func (r *Repo) RefsAll(ctx context.Context) (local, remote []Branch, tags []Tag,
 			continue
 		}
 		f := strings.Split(rec, "\x1f")
-		if len(f) < 7 {
+		if len(f) < 8 {
 			continue
 		}
 		short, refname, oid, objtype := f[0], f[1], f[2], f[3]
-		upstream, trackshort := f[4], f[5]
+		upstream, track, trackshort := f[4], f[5], f[6]
 		switch {
 		case strings.HasPrefix(refname, "refs/heads/"):
 			b := Branch{Name: short, OID: oid, Current: short == current}
 			if upstream != "" {
 				b.Upstream = upstream
 				b.HasTrack = true
-				b.Ahead, b.Behind = aheadBehindSymbols(trackshort)
+				b.Ahead, b.Behind = parseTrackCounts(track)
+				if b.Ahead == 0 && b.Behind == 0 {
+					b.Ahead, b.Behind = aheadBehindSymbols(trackshort)
+				}
 			}
 			local = append(local, b)
 		case strings.HasPrefix(refname, "refs/remotes/"):
@@ -69,7 +76,7 @@ func (r *Repo) RefsAll(ctx context.Context) (local, remote []Branch, tags []Tag,
 			t := Tag{Name: short, OID: oid}
 			if objtype == "tag" {
 				t.Annotated = true
-				t.Message = f[6]
+				t.Message = f[7]
 			}
 			tags = append(tags, t)
 		}
@@ -124,6 +131,29 @@ func (r *Repo) SetUpstream(ctx context.Context, upstream string) (*RunResult, er
 // CurrentBranch returns the checked-out branch name or "" if detached.
 func (r *Repo) CurrentBranch(ctx context.Context) (string, error) {
 	return r.headName(ctx)
+}
+
+// parseTrackCounts reads "[ahead N, behind M]" from %(upstream:track).
+// Empty/other strings return 0,0 so the caller can fall back to
+// trackshort's glyphs.
+func parseTrackCounts(track string) (ahead, behind int) {
+	// Expected forms: "", "[ahead 2]", "[behind 1]", "[ahead 2, behind 3]",
+	// "[gone]".
+	if !strings.HasPrefix(track, "[") {
+		return 0, 0
+	}
+	inner := strings.TrimSuffix(strings.TrimPrefix(track, "["), "]")
+	for _, part := range strings.Split(inner, ", ") {
+		var n int
+		if _, err := fmt.Sscanf(part, "ahead %d", &n); err == nil {
+			ahead = n
+			continue
+		}
+		if _, err := fmt.Sscanf(part, "behind %d", &n); err == nil {
+			behind = n
+		}
+	}
+	return ahead, behind
 }
 
 // aheadBehindSymbols turns git's trackshort glyphs into rough counts.

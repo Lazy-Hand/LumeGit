@@ -62,6 +62,13 @@ var ErrGitMissing = errors.New("git executable not found")
 type Repo struct {
 	// Worktree is the absolute path of the working tree.
 	Worktree string
+
+	// PreferNoUntracked asks Snapshot to run `status -uno` — report
+	// untracked entries at directory granularity instead of enumerating
+	// every file. Set it when a repo's untracked set is huge (VSCode's
+	// statusLimit is 10000): per-file stat()ing is the dominant cost of
+	// a refresh on such trees.
+	PreferNoUntracked bool
 }
 
 // NewRepo returns a Repo for the working tree at dir. It does not verify
