@@ -34,22 +34,18 @@ func (r *Repo) CompareFileDiff(ctx context.Context, ref, path string) (*DiffInfo
 
 // CompareFiles lists the files that differ between ref and HEAD
 // (IDEA: "Compare with Current" on a branch → its changed-files tree).
-// Returns name-status pairs, same shape as CommitFiles.
+// Two-dot diff: the rows are the state differences between the two
+// tips — the same pair selectFile diffs — so a file the row lists is
+// guaranteed to show a diff. (A three-dot merge-base…HEAD list can
+// name files whose ref:path and HEAD:path blobs are identical, which
+// opened to an empty diff — the "loads then nothing" bug.)
 func (r *Repo) CompareFiles(ctx context.Context, ref string) ([]CommitFile, error) {
-	res, err := r.Run(ctx, "diff", "--name-status", "-z", ref+"...HEAD")
+	res, err := r.Run(ctx, "diff", "--name-status", "-z", ref, "HEAD")
 	if err != nil {
 		return nil, err
 	}
 	if !res.ExitOK() {
-		// Fall back to two-dot when there is no merge base
-		// (unrelated histories).
-		res, err = r.Run(ctx, "diff", "--name-status", "-z", ref, "HEAD")
-		if err != nil {
-			return nil, err
-		}
-		if !res.ExitOK() {
-			return nil, &GitError{Args: []string{"diff", ref + "...HEAD"}, Stderr: res.OutputOfStderr()}
-		}
+		return nil, &GitError{Args: []string{"diff", ref, "HEAD"}, Stderr: res.OutputOfStderr()}
 	}
 	return parseNameStatus(res.Stdout), nil
 }

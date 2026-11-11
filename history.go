@@ -64,6 +64,8 @@ type historyModel struct {
 
 	// listState is the virtual list's scroll place + row identities.
 	listState ui.ListState
+	// scrollTarget is an OID scrollToCommit is still paging toward.
+	scrollTarget string
 	// filesList is the selected-commit file list's virtual-list state.
 	filesList ui.ListState
 }
@@ -141,6 +143,9 @@ func (h *historyModel) load(repoPath string, w updater) {
 			h.graph = git.BuildGraph(lr.commits)
 			h.unpushed = unpushed
 			h.ensureSelection(repoPath, w)
+			if h.scrollTarget != "" {
+				h.scrollToCommit(h.scrollTarget, repoPath, w)
+			}
 		})
 	}()
 }
@@ -181,6 +186,11 @@ func (h *historyModel) loadMore(repoPath string, w updater) {
 			}
 			h.commits = append(h.commits, commits...)
 			h.graph = git.BuildGraph(h.commits)
+			// A pending scrollToCommit keeps paging until the target
+			// shows up or the log runs out.
+			if h.scrollTarget != "" {
+				h.scrollToCommit(h.scrollTarget, repoPath, w)
+			}
 		})
 	}()
 }
@@ -192,6 +202,11 @@ func (h *historyModel) ensureSelection(repoPath string, w updater) {
 		if h.commits[i].OID == h.selectedID {
 			return
 		}
+	}
+	// A reflog "查看" may have picked a commit on an unloaded page —
+	// don't reset the selection while scrollToCommit is still paging.
+	if h.scrollTarget != "" {
+		return
 	}
 	h.selectedID = ""
 	h.files = nil
@@ -282,6 +297,7 @@ func (h *historyModel) reset() {
 	h.filesErr = ""
 	h.diffErr = ""
 	h.lastLoadedRepo = ""
+	h.scrollTarget = ""
 	h.gen++
 }
 
@@ -289,6 +305,26 @@ func (h *historyModel) reset() {
 func (h *historyModel) reloadFiltered(repoPath string, w updater) {
 	h.lastLoadedRepo = ""
 	h.load(repoPath, w)
+}
+
+// scrollToCommit scrolls the virtual list to the row showing oid. When
+// the commit isn't in the loaded pages yet it kicks loadMore and tries
+// again once that page lands — the pending OID rides in scrollTarget
+// so successive pages keep hunting until found or the log runs out.
+func (h *historyModel) scrollToCommit(oid, repoPath string, w updater) {
+	for i := range h.commits {
+		if h.commits[i].OID == oid {
+			h.listState.ScrollIntoView(i)
+			h.scrollTarget = ""
+			return
+		}
+	}
+	if h.hasMore {
+		h.scrollTarget = oid
+		h.loadMore(repoPath, w)
+	} else {
+		h.scrollTarget = ""
+	}
 }
 
 // gotoCommit jumps the selection to a hash prefix, branch or tag name.

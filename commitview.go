@@ -68,7 +68,7 @@ type app struct {
 	// Branch dialog (create from commit / rebase onto).
 	branchDialogOpen bool
 	newBranchFrom    string // OID to branch from, "" = HEAD
-	branchCmpOpen    bool   // "与 'xxx' 比较…" dialog
+	branchCmpOpen    bool   // "与其他分支比较…" dialog
 	branchCmpFrom    string // the ref picked first
 	branchCmpInput   string // second ref input
 
@@ -2152,7 +2152,7 @@ func (a *app) localBranchMenu(sub *ui.Menu, b *git.Branch) {
 		a.cmpDiffState = nil
 		a.compare.openFor(repoPath, name, a.updater())
 	}
-	if sub.Item("与 'xxx' 比较…").Chosen() {
+	if sub.Item("与其他分支比较…").Chosen() {
 		a.cmpDiffState = nil
 		a.branchCmpFrom = name
 		a.branchCmpOpen = true
@@ -2945,6 +2945,11 @@ func (a *app) compareOverlay(c *ui.Context, t *ui.Theme) {
 					a.placeholder(c, t, "无差异。")
 				case m.diff.Binary:
 					a.placeholder(c, t, "二进制文件。")
+				case string(m.diff.Old) == string(m.diff.New):
+					// The file row appeared under a merge-base diff but
+					// both tips hold identical content — say so rather
+					// than paint an all-context diff that reads as blank.
+					a.placeholder(c, t, "两端内容相同。")
 				default:
 					a.cmpDiffView(c, t)
 				}
@@ -3065,7 +3070,10 @@ func (a *app) cmpDiffView(c *ui.Context, t *ui.Theme) {
 		}
 	}
 	a.cmpDiffState.Layout = editor.DiffUnified
-	editor.DiffView(c, a.cmpDiffState).Grow(1).FillWidth()
+	// MinHeight: the Modal gives its content no fixed height to grow
+	// into, so Grow(1) alone can collapse the diff to zero pixels —
+	// the "loads then nothing" bug. fhDiffView does the same.
+	editor.DiffView(c, a.cmpDiffState).Grow(1).FillWidth().MinHeight(440)
 }
 
 // renameDialog edits a local branch's name (IDEA: branch → Rename).
@@ -3436,11 +3444,15 @@ func (a *app) reflogRow(c *ui.Context, t *ui.Theme, e *git.ReflogEntry) {
 					ui.Text(c, relTime(e.When)).FontSize(11).TextColor(t.TextMuted)
 				})
 			})
-			// Jump to that commit in Log.
+			// Jump to that commit in Log — also switch to the 历史 tab so
+			// the user lands on it (IDEA: Reflog → Show in Log).
 			action.Button(c, "查看", action.ButtonProps{Variant: action.Text, Size: theme.Small}).
 				OnClick(func() {
 					a.reflog.close()
+					a.tab = 1
+					a.history.ensureLoaded(repoPath, a.updater())
 					a.history.selectCommit(repoPath, e.OID, a.updater())
+					a.history.scrollToCommit(e.OID, a.commit.RepoPath, a.updater())
 				})
 		})
 }
