@@ -12,6 +12,10 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/egoist/mygo/ui"
+
+	"lumegit/internal/git"
 )
 
 func gitT(t *testing.T, dir string, args ...string) {
@@ -45,7 +49,7 @@ func TestCompareSelectFile(t *testing.T) {
 	for a.compare.loading && time.Now().Before(deadline) {
 		time.Sleep(20 * time.Millisecond)
 	}
-	t.Logf("loading=%v err=%q files=%d", a.compare.loading, a.compare.err, len(a.compare.files))
+	t.Logf("loading=%v err=%q files=%d cmp=%+v", a.compare.loading, a.compare.err, len(a.compare.files), a.compare.cmp)
 	if a.compare.err != "" {
 		t.Fatalf("load err: %s", a.compare.err)
 	}
@@ -66,4 +70,200 @@ func TestCompareSelectFile(t *testing.T) {
 		t.Fatal("diff stayed nil")
 	}
 	t.Logf("old=%q new=%q", a.compare.diff.Old, a.compare.diff.New)
+}
+
+// TestCompareBehindBranch covers the "当前分支 独有 N, ref 独有 0"
+// case the screenshot hit: comparing an ancestor ref against HEAD used
+// to show an empty file list because merge-base→ref is a no-op. The
+// panel should surface the divergence instead — base→HEAD here.
+func TestCompareBehindBranch(t *testing.T) {
+	dir := t.TempDir()
+	gitT(t, dir, "init", "-q")
+	gitT(t, dir, "config", "user.email", "a@b.c")
+	gitT(t, dir, "config", "user.name", "t")
+	os.WriteFile(filepath.Join(dir, "f.txt"), []byte("a\n"), 0644)
+	gitT(t, dir, "add", "-A")
+	gitT(t, dir, "commit", "-qm", "init")
+	gitT(t, dir, "checkout", "-qb", "release") // release stays at init
+	gitT(t, dir, "checkout", "-q", "master")
+	os.WriteFile(filepath.Join(dir, "f.txt"), []byte("a\nb\n"), 0644)
+	gitT(t, dir, "commit", "-qam", "ahead")
+
+	a := &app{}
+	a.commit.RepoPath = dir
+	sync := updater{update: func(fn func()) { fn() }}
+
+	a.compare.openFor(dir, "release", sync)
+	deadline := time.Now().Add(3 * time.Second)
+	for a.compare.loading && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if a.compare.err != "" {
+		t.Fatalf("load err: %s", a.compare.err)
+	}
+	// release has nothing unique; HEAD is 1 ahead. The file list must
+	// still show the divergence (base→HEAD), not read "没有差异文件".
+	if len(a.compare.files) == 0 {
+		t.Fatalf("behind-branch compare listed no files; cmp=%+v", a.compare.cmp)
+	}
+	if a.compare.cmp.FilesTo != "HEAD" {
+		t.Fatalf("FilesTo = %q, want HEAD", a.compare.cmp.FilesTo)
+	}
+
+	// Clicking a file diffs base→HEAD — the change HEAD has.
+	a.compare.selectFile(dir, "f.txt", sync)
+	deadline = time.Now().Add(3 * time.Second)
+	for a.compare.diffLoad && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if a.compare.diffErr != "" {
+		t.Fatalf("diff err: %s", a.compare.diffErr)
+	}
+	if a.compare.diff == nil || string(a.compare.diff.New) != "a\nb\n" {
+		t.Fatalf("diff = %+v", a.compare.diff)
+	}
+}
+
+// TestCompareWorktreeSelectFile exercises openForWorktree: the file
+// list comes from `git diff ref` and selectFile reads the worktree
+// side from disk — including a path absent in the ref (old side
+// empty), which used to surface a cat-file error as "no reaction".
+func TestCompareWorktreeSelectFile(t *testing.T) {
+	dir := t.TempDir()
+	gitT(t, dir, "init", "-q")
+	gitT(t, dir, "config", "user.email", "a@b.c")
+	gitT(t, dir, "config", "user.name", "t")
+	os.WriteFile(filepath.Join(dir, "f.txt"), []byte("a\n"), 0644)
+	gitT(t, dir, "add", "-A")
+	gitT(t, dir, "commit", "-qm", "init")
+	// Worktree edit + an untracked file not in HEAD.
+	os.WriteFile(filepath.Join(dir, "f.txt"), []byte("a\nb\n"), 0644)
+	os.WriteFile(filepath.Join(dir, "new.txt"), []byte("n\n"), 0644)
+
+	a := &app{}
+	a.commit.RepoPath = dir
+	sync := updater{update: func(fn func()) { fn() }}
+
+	// Whole-repo mode lists the tracked worktree diff.
+	a.compare.openForWorktree(dir, "HEAD", "", sync)
+	deadline := time.Now().Add(3 * time.Second)
+	for a.compare.loading && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if a.compare.err != "" {
+		t.Fatalf("load err: %s", a.compare.err)
+	}
+	if len(a.compare.files) != 1 || a.compare.files[0].Path != "f.txt" {
+		t.Fatalf("files = %+v, want [f.txt]", a.compare.files)
+	}
+
+	// A file in the worktree diff: old=HEAD blob, new=disk.
+	a.compare.selectFile(dir, "f.txt", sync)
+	deadline = time.Now().Add(3 * time.Second)
+	for a.compare.diffLoad && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if a.compare.diffErr != "" {
+		t.Fatalf("diff err: %s", a.compare.diffErr)
+	}
+	if string(a.compare.diff.Old) != "a\n" || string(a.compare.diff.New) != "a\nb\n" {
+		t.Fatalf("diff = %q → %q", a.compare.diff.Old, a.compare.diff.New)
+	}
+
+	// A path absent in HEAD (untracked): empty old side, not an error.
+	a.compare.selectFile(dir, "new.txt", sync)
+	deadline = time.Now().Add(3 * time.Second)
+	for a.compare.diffLoad && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if a.compare.diffErr != "" {
+		t.Fatalf("untracked diff err: %s", a.compare.diffErr)
+	}
+	if a.compare.diff == nil || string(a.compare.diff.New) != "n\n" || len(a.compare.diff.Old) != 0 {
+		t.Fatalf("untracked diff = %+v", a.compare.diff)
+	}
+
+	// Single-file mode opens straight onto the diff.
+	a.compare.openForWorktree(dir, "HEAD", "f.txt", sync)
+	deadline = time.Now().Add(3 * time.Second)
+	for a.compare.diffLoad && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if a.compare.selected != "f.txt" || a.compare.diff == nil {
+		t.Fatalf("single-file open: selected=%q diff=%v", a.compare.selected, a.compare.diff)
+	}
+}
+
+// TestCompareOverlayClick drives the real UI path: open the compare
+// modal on a repo with a ref↔HEAD diff, CLICK a file row, and assert
+// the diff pane leaves the placeholder — guards the whole
+// row→selectFile→cmpDiffView chain, not just the model.
+func TestCompareOverlayClick(t *testing.T) {
+	dir := t.TempDir()
+	gitT(t, dir, "init", "-q")
+	gitT(t, dir, "config", "user.email", "a@b.c")
+	gitT(t, dir, "config", "user.name", "t")
+	os.WriteFile(filepath.Join(dir, "f.txt"), []byte("a\n"), 0644)
+	gitT(t, dir, "add", "-A")
+	gitT(t, dir, "commit", "-qm", "init")
+	gitT(t, dir, "checkout", "-qb", "b1")
+	os.WriteFile(filepath.Join(dir, "f.txt"), []byte("a\nb\n"), 0644)
+	gitT(t, dir, "commit", "-qam", "b")
+	gitT(t, dir, "checkout", "-q", "master")
+
+	a := &app{}
+	a.commit.RepoPath = dir
+	a.commit.publish = func(fn func()) { fn() } // sync updates
+	a.commit.Snap = &git.Snapshot{Worktree: dir, HeadName: "master"}
+
+	a.compare.openFor(dir, "b1", a.updater())
+	deadline := time.Now().Add(3 * time.Second)
+	for a.compare.loading && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	tt := ui.NewTester(a.view, 1100, 700)
+	tt.Frame()
+	if !tt.HasText("f.txt") {
+		t.Fatalf("file row not rendered: %q", tt.Texts())
+	}
+	if err := tt.Click("f.txt"); err != nil {
+		t.Fatalf("row click: %v", err)
+	}
+	// selectFile is async even with sync publish — let it land.
+	deadline = time.Now().Add(3 * time.Second)
+	for a.compare.diffLoad && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	tt.Frame()
+	tt.Frame() // DiffView's first build may Invalidate for a second pass
+	if a.compare.diffErr != "" {
+		t.Fatalf("diffErr: %s", a.compare.diffErr)
+	}
+	if a.compare.diff == nil {
+		t.Fatalf("diff nil after click; texts %q", tt.Texts())
+	}
+	// The diff pane must have real geometry, not a zero-size collapse.
+	r, ok := tt.Find("New Text")
+	if !ok {
+		// Unified diff labels its editor "New Text"; fall back to
+		// checking the placeholder is gone at least.
+		if tt.HasText("选择文件查看差异。") {
+			t.Fatalf("placeholder still showing; texts %q", tt.Texts())
+		}
+		return
+	}
+	if r.W <= 0 || r.H <= 0 {
+		t.Fatalf("diff pane has no size: %v", r)
+	}
+
+	// Double-click: the second click on the shown file must not blank
+	// the pane back into a reload.
+	if err := tt.Click("f.txt"); err != nil {
+		t.Fatalf("re-click: %v", err)
+	}
+	tt.Frame()
+	if a.compare.diffLoad || a.compare.diff == nil {
+		t.Fatalf("re-click bounced the diff: load=%v diff=%v", a.compare.diffLoad, a.compare.diff)
+	}
 }

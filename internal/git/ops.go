@@ -2,6 +2,7 @@ package git
 
 import (
 	"context"
+	"fmt"
 	"strings"
 )
 
@@ -39,6 +40,34 @@ func (r *Repo) Reset(ctx context.Context, target string, mode ResetMode) (*RunRe
 		mode = ResetMixed
 	}
 	return r.Run(ctx, "reset", string(mode), target)
+}
+
+// UndoHeadCommit reverses the HEAD commit only (git reset --soft
+// HEAD~1) — IDEA's "Undo Commit": the changes stay in the worktree,
+// the commit message is preloaded for the next commit.
+func (r *Repo) UndoHeadCommit(ctx context.Context) (*RunResult, error) {
+	return r.Run(ctx, "reset", "--soft", "HEAD~1")
+}
+
+// AmendMessage rewrites the HEAD commit's message (git commit --amend
+// -m). For a non-HEAD commit the caller routes through the rebase plan
+// (reword) instead — this is the fast path for the top commit only.
+func (r *Repo) AmendMessage(ctx context.Context, msg string) (*RunResult, error) {
+	return r.Run(ctx, "commit", "--amend", "-m", msg)
+}
+
+// PushUpTo pushes the current branch's history up to (and including)
+// oid — IDEA's "Push all commits up to here". It maps to
+// `git push <remote> <oid>:refs/heads/<branch>`.
+func (r *Repo) PushUpTo(ctx context.Context, oid, remote string) (*RunResult, error) {
+	if remote == "" {
+		remote = "origin"
+	}
+	head, err := r.headName(ctx)
+	if err != nil || head == "" {
+		return &RunResult{}, fmt.Errorf("分离 HEAD 不能推送分支")
+	}
+	return r.Run(ctx, "push", remote, oid+":refs/heads/"+head)
 }
 
 // OpOutput renders a RunResult for the operation log.

@@ -79,6 +79,16 @@ type app struct {
 	branchInput      string // text field for the new name / rebase target
 	branchDialogKind int    // 0 = new branch, 1 = rebase onto
 
+	// Amend-commit-message dialog (IDEA: "编辑提交消息…" on HEAD).
+	amendOpen  bool
+	amendOID   string // commit being amended (must be HEAD)
+	amendInput string // new message
+
+	// "推送此前所有提交…" dialog (IDEA: Push up to here).
+	pushUpToOpen bool
+	pushUpToOID  string // last commit to include
+	pushUpToShort string // display-only short OID
+
 	// Diff state for the current file, rebuilt per selection.
 	diffState    *editor.DiffState
 	fhDiffState  *editor.DiffState // separate state for the file-history overlay
@@ -176,6 +186,12 @@ func (a *app) view(c *ui.Context) {
 	// Interactive-rebase plan panel.
 	if a.commit.rebaseDlg.Open {
 		a.rebaseDialogView(c, t)
+	}
+	if a.amendOpen {
+		a.amendDialog(c, t)
+	}
+	if a.pushUpToOpen {
+		a.pushUpToDialog(c, t)
 	}
 	// Branch-compare overlay.
 	if a.compare.open {
@@ -1574,16 +1590,47 @@ func (a *app) commitRowView(c *ui.Context, t *ui.Theme, cm *git.Commit, gl *git.
 		a.history.selectCommit(repoPath, oid, a.updater())
 	})
 	rowEl.ContextMenu(func(mn *ui.Menu) {
+		isHead := len(a.history.commits) > 0 && a.history.commits[0].OID == oid
+		if mn.Item("复制修订号").Chosen() {
+			c.WriteClipboard(oid)
+			a.notify("success", "已复制 "+cm.ShortOID)
+		}
+		mn.Separator()
 		if mn.Item("Cherry-pick 到当前分支").Chosen() {
 			a.commit.cherryPick(appCTX, a.updater(), oid)
 		}
+		if isHead {
+			if mn.Item("撤消提交…").Chosen() {
+				a.commit.undoHeadCommit(appCTX, a.updater())
+			}
+		}
 		if mn.Item("从此提交交互式变基…").Chosen() {
 			a.commit.openRebaseDialog(a.updater(), oid)
+		}
+		if isHead {
+			if mn.Item("编辑提交消息…").Chosen() {
+				a.amendOID = oid
+				a.amendInput = cm.Subject
+				a.amendOpen = true
+			}
+		} else {
+			if mn.Item("编辑提交消息…").Chosen() {
+				a.commit.openRebaseDialogPreset(a.updater(), oid+"~1", oid, git.RebaseReword)
+			}
+			if mn.Item("删除提交").Chosen() {
+				a.commit.openRebaseDialogPreset(a.updater(), oid+"~1", oid, git.RebaseDrop)
+			}
+			if mn.Item("压缩提交…").Chosen() {
+				a.commit.openRebaseDialogPreset(a.updater(), oid+"~1", oid, git.RebaseSquash)
+			}
 		}
 		if mn.Item("Revert 此提交").Chosen() {
 			a.commit.revertCommit(appCTX, a.updater(), oid)
 		}
 		mn.Separator()
+		if mn.Item("与本地比较").Chosen() {
+			a.compare.openForWorktree(repoPath, oid, "", a.updater())
+		}
 		if mn.Item("从此提交新建分支…").Chosen() {
 			a.newBranchFrom = oid
 			a.branchDialogOpen = true
@@ -1599,6 +1646,11 @@ func (a *app) commitRowView(c *ui.Context, t *ui.Theme, cm *git.Commit, gl *git.
 			a.exportCommitPatch(oid, cm.ShortOID)
 		}
 		mn.Separator()
+		if mn.Item("推送此前所有提交…").Chosen() {
+			a.pushUpToOID = oid
+			a.pushUpToShort = cm.ShortOID
+			a.pushUpToOpen = true
+		}
 		if mn.Item("软重置到此提交").Chosen() {
 			a.commit.resetTo(appCTX, a.updater(), oid, git.ResetSoft)
 		}
@@ -1607,6 +1659,18 @@ func (a *app) commitRowView(c *ui.Context, t *ui.Theme, cm *git.Commit, gl *git.
 		}
 		if mn.Item("硬重置到此提交").Chosen() {
 			a.commit.resetTo(appCTX, a.updater(), oid, git.ResetHard)
+		}
+		mn.Separator()
+		if mn.Item("转到子提交").Chosen() {
+			for _, k := range a.history.commits {
+				if len(k.Parents) > 0 && k.Parents[0] == oid {
+					a.history.scrollToCommit(k.OID, repoPath, a.updater())
+					break
+				}
+			}
+		}
+		if len(cm.Parents) > 0 && mn.Item("转到父提交").Chosen() {
+			a.history.scrollToCommit(cm.Parents[0], repoPath, a.updater())
 		}
 	})
 	rowEl.Children(func() {
@@ -2668,33 +2732,7 @@ func (a *app) createTag() {
 // worktree — IDEA's "Compare with Local".
 func (a *app) openWorktreeCompare(path, ref string) {
 	a.cmpDiffState = nil
-	m := &a.compare
-	m.open = true
-	m.ref = ref
-	m.selected = path
-	m.files = nil
-	m.loading = false
-	m.diff = nil
-	m.diffErr = ""
-	m.diffLoad = true
-	repoPath := a.commit.RepoPath
-	m.gen++
-	gen := m.gen
-	go func() {
-		repo := git.NewRepo(repoPath)
-		d, err := repo.CompareFileDiff(context.Background(), ref, path)
-		a.updater().update(func() {
-			if gen != m.gen {
-				return
-			}
-			m.diffLoad = false
-			if err != nil {
-				m.diffErr = err.Error()
-				return
-			}
-			m.diff = d
-		})
-	}()
+	a.compare.openForWorktree(a.commit.RepoPath, ref, path, a.updater())
 }
 
 // bisectOverlay renders IDEA's Bisect panel: start form when inactive,
@@ -2890,25 +2928,35 @@ func (a *app) confirmStashBranch() bool {
 	return true
 }
 
-// compareOverlay is the branch/worktree compare modal. Two modes:
-// single-ref ("与分支比较" → ref↔HEAD files) and two-ref ("与 'xxx'
-// 比较" → unique commits both ways + merge-base…refB diff).
+// compareOverlay is the branch/worktree compare modal. Single and
+// two-ref modes share one shape (IDEA "Compare with Current" / "Compare
+// with 'xxx'"): unique-commit lists on top when a BranchCompare is
+// loaded, the file diff list under them, diff on the right. Worktree
+// mode skips the commit lists — there's nothing to merge-base against.
 func (a *app) compareOverlay(c *ui.Context, t *ui.Theme) {
 	m := &a.compare
 	title := "比较 — " + m.ref
-	if m.refB != "" {
+	switch {
+	case m.worktreeMode:
+		title = "与工作区比较 — " + m.ref
+	case m.refB != "":
 		title = "比较 — " + m.ref + " ↔ " + m.refB
 	}
 	feedback.Modal(c, &m.open, feedback.ModalProps{
 		Title:    title,
-		Width:    940,
+		Width:    1100,
 		NoFooter: true,
 	}, func() {
-		ui.Row(c).Fill().MinHeight(460).Children(func() {
-			// Left pane: in two-ref mode, unique-commit lists first.
-			ui.Column(c).Width(300).Fill().Children(func() {
-				if m.refB != "" {
-					a.branchCompareSides(c, t)
+		ui.Row(c).Fill().MinHeight(520).MaxHeight(640).Children(func() {
+			// Left pane: unique commits on top (bounded — a long list
+			// used to stretch the modal past the window), files below.
+			ui.Column(c).Width(340).Fill().Children(func() {
+				if m.cmp != nil {
+					ui.Column(c).FillWidth().MaxHeight(170).Children(func() {
+						layout.ScrollArea(c, layout.ScrollAreaProps{}, func() {
+							a.branchCompareSides(c, t)
+						})
+					})
 				}
 				switch {
 				case m.loading:
@@ -2929,11 +2977,13 @@ func (a *app) compareOverlay(c *ui.Context, t *ui.Theme) {
 								a.compareFileRow(c, t, m.files[i])
 							}
 						})
-					}).Grow(1)
+					}).Grow(1).MinHeight(120)
 				}
 			})
-			// Right: diff.
-			ui.Column(c).Grow(1).Fill().Padding(0, 0, 0, 12).Children(func() {
+			// Right: diff. MinWidth keeps the pane from collapsing into
+			// a sliver when the commit lists are long; MinHeight gives
+			// the Modal's unconstrained height a floor to grow into.
+			ui.Column(c).Grow(1).MinWidth(300).Fill().MinHeight(440).Padding(0, 0, 0, 12).Children(func() {
 				switch {
 				case m.selected == "":
 					a.placeholder(c, t, "选择文件查看差异。")
@@ -2987,17 +3037,29 @@ func (a *app) confirmBranchCompare() bool {
 	return true
 }
 
-// branchCompareSides renders the unique-commits lists in two-ref mode:
-// ref 独有 / refB 独有 (IDEA's two-panel "Compare with 'xxx'").
+// branchCompareSides renders the unique-commits lists (IDEA's
+// "commits in A not in B" panels). Two-ref mode labels them with both
+// refs; single mode labels the second side "当前分支" (HEAD).
 func (a *app) branchCompareSides(c *ui.Context, t *ui.Theme) {
 	m := &a.compare
 	if m.cmp == nil {
 		return
 	}
+	other := m.refB
+	if other == "" {
+		other = "当前分支"
+	}
+	// CompareBranches is always called with a=HEAD-equivalent side
+	// first: single mode CompareBranches(HEAD, ref) puts ref's unique
+	// commits in BOnly; two-ref openForBranches(a, b) puts a's in AOnly.
+	ours, theirs := m.cmp.AOnly, m.cmp.BOnly
+	if m.refB == "" {
+		ours, theirs = m.cmp.BOnly, m.cmp.AOnly
+	}
 	ui.Column(c).FillWidth().Gap(2).Children(func() {
 		ui.Text(c, "独有提交").FontSize(11).Bold().TextColor(t.TextMuted).Padding(4, 0)
-		a.cmpSide(c, t, m.ref+" 独有", m.cmp.AOnly)
-		a.cmpSide(c, t, m.refB+" 独有", m.cmp.BOnly)
+		a.cmpSide(c, t, m.ref+" 独有", ours)
+		a.cmpSide(c, t, other+" 独有", theirs)
 		if m.cmp.Unrelated {
 			feedback.Alert(c, "两个分支没有共同祖先", feedback.AlertProps{Type: feedback.Warning, Variant: feedback.Soft})
 		}
@@ -3070,10 +3132,58 @@ func (a *app) cmpDiffView(c *ui.Context, t *ui.Theme) {
 		}
 	}
 	a.cmpDiffState.Layout = editor.DiffUnified
-	// MinHeight: the Modal gives its content no fixed height to grow
-	// into, so Grow(1) alone can collapse the diff to zero pixels —
-	// the "loads then nothing" bug. fhDiffView does the same.
-	editor.DiffView(c, a.cmpDiffState).Grow(1).FillWidth().MinHeight(440)
+	// Height (not Grow): inside the Modal's own scroll a Grow child is
+	// unconstrained — the diff must own the pane's fixed height so its
+	// top stays pinned while the file list scrolls on the left.
+	editor.DiffView(c, a.cmpDiffState).Fill().MinHeight(440)
+}
+
+// amendDialog edits the HEAD commit's message (IDEA: "编辑提交消息…").
+func (a *app) amendDialog(c *ui.Context, t *ui.Theme) {
+	confirmed := feedback.Modal(c, &a.amendOpen, feedback.ModalProps{
+		Title:  "编辑提交消息",
+		Width:  480,
+		OkText: "确定",
+	}, func() {
+		ui.Column(c).Gap(8).Children(func() {
+			ui.Text(c, "修改最近一条提交的提交信息").FontSize(12).TextColor(t.TextMuted)
+			field.TextArea(c, &a.amendInput, field.TextAreaProps{
+				Placeholder: "提交信息…",
+				MinRows:     3,
+				MaxRows:     8,
+			}).Grow(1)
+		})
+	})
+	if confirmed && strings.TrimSpace(a.amendInput) != "" {
+		msg := a.amendInput
+		a.amendOpen = false
+		a.commit.runOp(appCTX, a.updater(), "正在修改…", "已修改提交信息",
+			func(ctx context.Context, r *git.Repo) (*git.RunResult, error) {
+				return r.AmendMessage(ctx, msg)
+			}, func() {
+				a.history.lastLoadedRepo = "" // subject changed — reload log
+			})
+	}
+}
+
+// pushUpToDialog confirms "推送此前所有提交…": pushes the current
+// branch's commits up to (and including) a chosen commit.
+func (a *app) pushUpToDialog(c *ui.Context, t *ui.Theme) {
+	confirmed := feedback.Modal(c, &a.pushUpToOpen, feedback.ModalProps{
+		Title:  "推送此前所有提交",
+		Width:  440,
+		OkText: "推送",
+	}, func() {
+		ui.Column(c).Gap(8).Children(func() {
+			ui.Text(c, "把当前分支在 "+a.pushUpToShort+" 及之前的所有提交推送到远端").
+				FontSize(12).TextColor(t.TextMuted)
+		})
+	})
+	if confirmed {
+		oid := a.pushUpToOID
+		a.pushUpToOpen = false
+		a.commit.pushUpTo(appCTX, a.updater(), oid)
+	}
 }
 
 // renameDialog edits a local branch's name (IDEA: branch → Rename).

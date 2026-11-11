@@ -17,7 +17,12 @@ func (r *Repo) CompareFileDiff(ctx context.Context, ref, path string) (*DiffInfo
 	}
 	old, err := r.catFile(ctx, ref+":"+path)
 	if err != nil {
-		return nil, fmt.Errorf("compare %s:%s: %w", ref, path, err)
+		// Path absent in the ref is a valid side too (untracked locally):
+		// an empty old half, not an error the modal should show.
+		if !isCatFileMissing(err) {
+			return nil, fmt.Errorf("compare %s:%s: %w", ref, path, err)
+		}
+		old = nil
 	}
 	info.Old = old
 	wt, err := readWorktreeFile(ctx, r, path)
@@ -30,6 +35,17 @@ func (r *Repo) CompareFileDiff(ctx context.Context, ref, path string) (*DiffInfo
 		return info, nil
 	}
 	return info, nil
+}
+
+// isCatFileMissing reports a `cat-file`-style "object/path not found"
+// error — the blob simply isn't there, not a real failure.
+func isCatFileMissing(err error) bool {
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "not exist") ||
+		strings.Contains(s, "bad object") ||
+		strings.Contains(s, "invalid object name") ||
+		strings.Contains(s, "bad revision") ||
+		strings.Contains(s, "not found")
 }
 
 // CompareFiles lists the files that differ between ref and HEAD
@@ -46,6 +62,25 @@ func (r *Repo) CompareFiles(ctx context.Context, ref string) ([]CommitFile, erro
 	}
 	if !res.ExitOK() {
 		return nil, &GitError{Args: []string{"diff", ref, "HEAD"}, Stderr: res.OutputOfStderr()}
+	}
+	return parseNameStatus(res.Stdout), nil
+}
+
+// CompareFilesWorktree lists files differing between ref and the
+// working tree (`git diff ref` — tracked edits only; untracked files
+// never appear in a ref↔worktree diff). path non-empty scopes the
+// check to one file.
+func (r *Repo) CompareFilesWorktree(ctx context.Context, ref, path string) ([]CommitFile, error) {
+	args := []string{"diff", "--name-status", "-z", ref, "--"}
+	if path != "" {
+		args = append(args, path)
+	}
+	res, err := r.Run(ctx, args...)
+	if err != nil {
+		return nil, err
+	}
+	if !res.ExitOK() {
+		return nil, &GitError{Args: []string{"diff", ref}, Stderr: res.OutputOfStderr()}
 	}
 	return parseNameStatus(res.Stdout), nil
 }
@@ -79,8 +114,12 @@ type BranchCompare struct {
 	Base      string       // merge-base OID (empty when unrelated)
 	AOnly     []Commit     // commits on a only — "ours" side
 	BOnly     []Commit     // commits on b only — "theirs" side
-	Files     []CommitFile // merge-base..ref diff (what merging b into a would change)
-	Unrelated bool         // histories share no ancestor
+	Files     []CommitFile // the diverging side's diff (see FilesFrom/To)
+	// FilesFrom/FilesTo name the endpoints Files was generated with —
+	// selectFile must diff the same pair or a listed file opens blank.
+	FilesFrom string
+	FilesTo   string
+	Unrelated bool // histories share no ancestor
 }
 
 // CompareBranches computes the two-sided comparison of branch a vs b.
@@ -105,12 +144,24 @@ func (r *Repo) CompareBranches(ctx context.Context, a, b string) (*BranchCompare
 		return nil, err
 	}
 
-	// File diff: merge-base..b — what merging would bring in.
-	if out.Unrelated {
+	// File diff: the side that actually diverges. When only one side has
+	// unique commits (fast-forward / fast-forwardable), the merge-base
+	// diff on the *empty* side is empty and the panel reads "没有差异文件"
+	// — IDEA still shows the divergence, which lives on the other side.
+	switch {
+	case out.Unrelated:
 		// No base: diff the two tips directly.
 		out.Files, err = r.compareTwoRefs(ctx, a, b)
-	} else {
+		out.FilesFrom, out.FilesTo = a, b
+	case len(out.AOnly) > 0 && len(out.BOnly) == 0:
+		// Only "ours" moved ahead — show what merging *b* into *a*
+		// would revert, i.e. base→a. IDEA surfaces the same direction.
+		out.Files, err = r.compareTwoRefs(ctx, base, a)
+		out.FilesFrom, out.FilesTo = base, a
+	default:
+		// BOnly non-empty or both: what merging b into a brings in.
 		out.Files, err = r.compareTwoRefs(ctx, base, b)
+		out.FilesFrom, out.FilesTo = base, b
 	}
 	if err != nil {
 		return nil, err

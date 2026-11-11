@@ -869,6 +869,24 @@ func (m *commitModel) resetTo(ctx context.Context, w updater, oid string, mode g
 		}, nil)
 }
 
+// undoHeadCommit reverses the HEAD commit only (IDEA: "撤消提交…").
+// The changes stay in the worktree staged for the next commit.
+func (m *commitModel) undoHeadCommit(ctx context.Context, w updater) {
+	m.runOp(ctx, w, "正在撤消提交…", "已撤消，改动已留在工作区",
+		func(ctx context.Context, r *git.Repo) (*git.RunResult, error) {
+			return r.UndoHeadCommit(ctx)
+		}, nil)
+}
+
+// pushUpTo pushes the current branch's history up to oid — IDEA's
+// "推送此前所有提交…" on a log row.
+func (m *commitModel) pushUpTo(ctx context.Context, w updater, oid string) {
+	m.runOp(ctx, w, "正在推送…", "已推送",
+		func(ctx context.Context, r *git.Repo) (*git.RunResult, error) {
+			return r.PushUpTo(ctx, oid, "")
+		}, nil)
+}
+
 // groupCheckBind returns the *bool the group checkbox binds. Its
 // value is the previous frame's checked state; the view compares it
 // against the group's actual CheckedN each frame to decide the next
@@ -1031,7 +1049,13 @@ func (m *commitModel) selectFile(f git.FileChange) {
 	m.diffLoading = true
 	path, origPath := f.Path, f.OrigPath
 	repoPath := m.RepoPath
-	w := updater{update: m.publish}
+	update := m.publish
+	if update == nil {
+		// Tests drive models without a window; a nil publish used to
+		// panic inside the worker's update closure.
+		update = func(fn func()) { fn() }
+	}
+	w := updater{update: update}
 	ctx, cancel := context.WithCancel(context.Background())
 	m.diffCancel = cancel
 
@@ -1277,6 +1301,14 @@ func (m *commitModel) push(ctx context.Context, w updater) {
 
 // openRebaseDialog loads the plan for onto..HEAD and opens the panel.
 func (m *commitModel) openRebaseDialog(w updater, onto string) {
+	m.openRebaseDialogPreset(w, onto, "", "")
+}
+
+// openRebaseDialogPreset opens the same panel but pre-sets one entry's
+// action — IDEA's "编辑提交消息…" (reword), "删除提交" (drop) and
+// "压缩提交…" (squash) all land here with the commit pre-marked, so
+// the user confirms the plan rather than rebuilding it by hand.
+func (m *commitModel) openRebaseDialogPreset(w updater, onto, targetOID string, action git.RebaseAction) {
 	if m.RepoPath == "" {
 		return
 	}
@@ -1288,6 +1320,14 @@ func (m *commitModel) openRebaseDialog(w updater, onto string) {
 			if err != nil {
 				m.lastErr = "变基计划：" + err.Error()
 				return
+			}
+			if targetOID != "" && action != "" {
+				for i := range entries {
+					if entries[i].OID == targetOID || entries[i].Short == targetOID {
+						entries[i].Action = action
+						break
+					}
+				}
 			}
 			m.rebaseDlg = rebaseDialog{Open: true, Onto: onto, Entries: entries}
 		})
