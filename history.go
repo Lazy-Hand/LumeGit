@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 
+	"github.com/egoist/mygo/ui"
+
 	"lumegit/internal/git"
 )
 
@@ -59,6 +61,11 @@ type historyModel struct {
 	gotoOpen  bool
 	gotoInput string
 	gotoErr   string
+
+	// listState is the virtual list's scroll place + row identities.
+	listState ui.ListState
+	// filesList is the selected-commit file list's virtual-list state.
+	filesList ui.ListState
 }
 
 // ensureLoaded starts a log load when the repo changes (or nothing was

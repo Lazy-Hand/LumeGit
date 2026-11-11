@@ -1474,26 +1474,35 @@ func (a *app) commitListPane(c *ui.Context, t *ui.Theme) {
 				Description: "此分支还没有提交记录",
 			}).Padding(24)
 		default:
-			layout.ScrollArea(c, layout.ScrollAreaProps{}, func() {
-				ui.Column(c).FillWidth().Children(func() {
-					for i := range m.commits {
-						var gl *git.GraphLine
-						if i < len(m.graph) {
-							gl = &m.graph[i]
-						}
-						a.commitRowView(c, t, &m.commits[i], gl)
+			// ui.List is mygo's virtual list: it builds only the rows in
+			// view (plus a few), so 5000-commit histories cost the same
+			// as 50. Key = OID keeps selection/scroll stable as pages
+			// append below.
+			m.listState.Key = func(row int) any {
+				if row < len(m.commits) {
+					return m.commits[row].OID
+				}
+				return "loadmore"
+			}
+			n := len(m.commits)
+			if m.hasMore {
+				n++ // trailing "load more" row
+			}
+			ui.List(c, &m.listState, n, func(i int) {
+				if i < len(m.commits) {
+					var gl *git.GraphLine
+					if i < len(m.graph) {
+						gl = &m.graph[i]
 					}
-					// IDEA lazy-loads on scroll-to-bottom; a button is the
-					// explicit affordance and keeps the row count testable.
-					if m.hasMore {
-						ui.Row(c).FillWidth().Padding(6, 14).Children(func() {
-							if m.loading {
-								ui.Text(c, "正在加载…").FontSize(11).TextColor(t.TextMuted)
-							} else {
-								action.Button(c, "加载更多提交…", action.ButtonProps{Variant: action.Text, Size: theme.Small}).
-									OnClick(func() { m.loadMore(a.commit.RepoPath, a.updater()) })
-							}
-						})
+					a.commitRowView(c, t, &m.commits[i], gl)
+					return
+				}
+				ui.Row(c).FillWidth().Padding(6, 14).Children(func() {
+					if m.loading {
+						ui.Text(c, "正在加载…").FontSize(11).TextColor(t.TextMuted)
+					} else {
+						action.Button(c, "加载更多提交…", action.ButtonProps{Variant: action.Text, Size: theme.Small}).
+							OnClick(func() { m.loadMore(a.commit.RepoPath, a.updater()) })
 					}
 				})
 			}).Grow(1)
@@ -1665,12 +1674,9 @@ func (a *app) commitFilesPane(c *ui.Context, t *ui.Theme) {
 		case len(m.files) == 0:
 			a.placeholder(c, t, "无文件变更。")
 		default:
-			layout.ScrollArea(c, layout.ScrollAreaProps{}, func() {
-				ui.Column(c).FillWidth().Children(func() {
-					for i := range m.files {
-						a.commitFileRowView(c, t, &m.files[i])
-					}
-				})
+			m.filesList.Key = func(row int) any { return m.files[row].Path }
+			ui.List(c, &m.filesList, len(m.files), func(i int) {
+				a.commitFileRowView(c, t, &m.files[i])
 			}).Grow(1)
 		}
 	})

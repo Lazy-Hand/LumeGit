@@ -1,17 +1,20 @@
 # Changelog
 
+## [0.1.10] - 2026-11-11
+
+- 性能：打开仓库自动启用 `core.fsmonitor`（git ≥2.36）
+- 性能：历史提交/提交文件列表虚拟化（ui.List，只渲染可视行）+ log 分页加载（每页 50 + 加载更多）
+- 性能：untracked 文件超 2000 时 `git status` 自动降级 `-uno`
+- 性能：refs 轮询随窗口 focus 自适应（2s ↔ 10s），diff 选中切换时取消过期后台任务
+- 性能：分支 ahead/behind 从 `for-each-ref` 的 `%(upstream:track)` 一次取精确数字
+- 性能：打开仓库后台预热历史/搁置/分支缓存
+
 ## [0.1.9] - 2026-11-11
 
 - 「分支」tab 移除：header 分支名点击弹出 IDEA 式分支菜单（新建分支/标签/远程/工作树 + 每条分支内嵌切换/合并/变基/比较/重命名/删除）
 - 性能：fsnotify 工作区 watch 改为 lazygit 式 refs 指纹轮询（2s）+ 窗口 focus 刷新——大仓库刷新不再 CPU 拉满
 - 修复：手动刷新与后台刷新互斥，不再叠加 git status 进程
 - 更新弹窗中文化（zh-Hans）
-- 性能：打开仓库自动启用 `core.fsmonitor`（git ≥2.36，状态查询 600ms→50ms 量级）
-- 性能：历史提交分页加载（每页 50 条 + 「加载更多」），首屏快 6 倍
-- 性能：untracked 文件超 2000 时 `git status` 自动降级 `-uno`
-- 性能：refs 轮询随窗口 focus 自适应（2s ↔ 10s），diff 选中切换时取消过期后台任务
-- 性能：分支 ahead/behind 从 `for-each-ref` 的 `%(upstream:track)` 一次取精确数字，不再每分支一次 `rev-list`
-- 性能：打开仓库后台预热历史/搁置/分支缓存，切 tab 不再冷启动
 
 ## [0.1.8] - 2026-11-10
 
