@@ -12,6 +12,7 @@ import (
 
 	"lumegit/internal/git"
 	"lumegit/internal/store"
+	"lumegit/internal/vcs"
 )
 
 // TestPickViewRenders checks the no-repo screen builds headlessly.
@@ -31,7 +32,7 @@ func TestPickViewRenders(t *testing.T) {
 func TestCommitViewRenders(t *testing.T) {
 	a := &app{}
 	a.commit.RepoPath = "/fake/repo"
-	a.commit.Snap = fakeSnapshot(t)
+	a.commit.Snap = vcs.WrapGit(fakeSnapshot(t))
 	tt := ui.NewTester(a.view, 1080, 720)
 	for _, want := range []string{"repo", "main", "提交", "提交并推送", "a.txt", "0 of 3"} {
 		if !tt.HasText(want) {
@@ -45,7 +46,7 @@ func TestCommitViewRenders(t *testing.T) {
 func TestFileSelectionShowsDiff(t *testing.T) {
 	a := &app{}
 	a.commit.RepoPath = "/fake/repo"
-	a.commit.Snap = fakeSnapshot(t)
+	a.commit.Snap = vcs.WrapGit(fakeSnapshot(t))
 	tt := ui.NewTester(a.view, 1080, 720)
 	if !tt.HasText("选择文件查看变更。") {
 		t.Errorf("placeholder missing before selection: %q", tt.Texts())
@@ -82,17 +83,27 @@ func TestHistoryMenuActions(t *testing.T) {
 
 	a := &app{}
 	a.commit.RepoPath = dir
-	sync := updater{update: func(fn func()) { fn() }}
+	pub := &testPublisher{}
+	a.commit.publish = pub.publish // selectFile's worker publishes via this
+	sync := updater{update: pub.publish}
+	waitBusy := func() {
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) {
+			pub.drain()
+			if !a.commit.busy {
+				pub.drain()
+				return
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
 
 	// Undo HEAD: HEAD should move to c2, worktree keeps c3's changes.
 	cmd := exec2.Command("git", "rev-parse", "HEAD")
 	cmd.Dir = dir
 	before, _ := cmd.Output()
 	a.commit.undoHeadCommit(context.Background(), sync)
-	deadline := time.Now().Add(3 * time.Second)
-	for a.commit.busy && time.Now().Before(deadline) {
-		time.Sleep(20 * time.Millisecond)
-	}
+	waitBusy()
 	cmd = exec2.Command("git", "rev-parse", "HEAD")
 	cmd.Dir = dir
 	after, _ := cmd.Output()
@@ -116,10 +127,7 @@ func TestHistoryMenuActions(t *testing.T) {
 		func(ctx context.Context, r *git.Repo) (*git.RunResult, error) {
 			return r.AmendMessage(ctx, "renamed c2")
 		}, nil)
-	deadline = time.Now().Add(3 * time.Second)
-	for a.commit.busy && time.Now().Before(deadline) {
-		time.Sleep(20 * time.Millisecond)
-	}
+	waitBusy()
 	cmd = exec2.Command("git", "log", "-1", "--format=%s")
 	cmd.Dir = dir
 	subj, _ = cmd.Output()
@@ -130,10 +138,12 @@ func TestHistoryMenuActions(t *testing.T) {
 	// Rebase preset: openRebaseDialogPreset marks one entry's action.
 	// (Drop c1 → opens plan for c1~1..HEAD with c1 marked drop.)
 	a.commit.openRebaseDialogPreset(sync, "HEAD~1", "", git.RebaseDrop)
-	deadline = time.Now().Add(3 * time.Second)
-	for !a.commit.rebaseDlg.Open && time.Now().Before(deadline) {
+	dl := time.Now().Add(3 * time.Second)
+	for !a.commit.rebaseDlg.Open && time.Now().Before(dl) {
+		pub.drain()
 		time.Sleep(20 * time.Millisecond)
 	}
+	pub.drain()
 	if !a.commit.rebaseDlg.Open {
 		t.Fatal("rebase dialog never opened")
 	}
@@ -166,8 +176,11 @@ func TestOpenRepoFlow(t *testing.T) {
 	t.Cleanup(func() { spawnWindowHook = nil })
 
 	a := &app{}
-	// Sync publish: run update closures immediately (headless).
-	a.commit.publish = func(fn func()) { fn() }
+	// Queue publishes like a real UI thread and drain on the test
+	// goroutine — running closures inside the worker makes model writes
+	// race the test's field reads.
+	pub := &testPublisher{}
+	a.commit.publish = pub.publish
 	a.pickPath = dir
 	tt := ui.NewTester(a.view, 1080, 720)
 	if err := tt.Click("打开"); err != nil {
@@ -179,10 +192,15 @@ func TestOpenRepoFlow(t *testing.T) {
 
 	// The spawned window's open runs the same path — run it inline.
 	a.openPickedRepo()
-	deadline := time.Now().Add(2 * time.Second)
-	for a.commit.RepoPath == "" && a.commit.busy && time.Now().Before(deadline) {
+	deadline := time.Now().Add(4 * time.Second)
+	for time.Now().Before(deadline) {
+		pub.drain()
+		if a.commit.RepoPath != "" && !a.commit.busy {
+			break
+		}
 		time.Sleep(5 * time.Millisecond)
 	}
+	pub.drain()
 	tt.Frame()
 	if a.commit.RepoPath == "" {
 		t.Fatalf("repo not opened: openErr=%q busy=%v texts=%q",
@@ -198,7 +216,7 @@ func TestOpenRepoFlow(t *testing.T) {
 func TestHistoryViewRenders(t *testing.T) {
 	a := &app{}
 	a.commit.RepoPath = "/fake/repo"
-	a.commit.Snap = fakeSnapshot(t)
+	a.commit.Snap = vcs.WrapGit(fakeSnapshot(t))
 	a.commit.publish = func(fn func()) { fn() }
 	a.tab = 1
 	a.histListW = 380
@@ -226,7 +244,7 @@ func TestHistoryViewRenders(t *testing.T) {
 func TestChangelistGrouping(t *testing.T) {
 	a := &app{}
 	a.commit.RepoPath = "/fake/repo"
-	a.commit.Snap = fakeSnapshot(t)
+	a.commit.Snap = vcs.WrapGit(fakeSnapshot(t))
 	a.commit.publish = func(fn func()) { fn() }
 	m := &a.commit
 	m.repos = &store.Manager{} // in-memory, no file
@@ -274,7 +292,7 @@ func TestChangelistGrouping(t *testing.T) {
 func TestShelfViewRenders(t *testing.T) {
 	a := &app{}
 	a.commit.RepoPath = "/fake/repo"
-	a.commit.Snap = fakeSnapshot(t)
+	a.commit.Snap = vcs.WrapGit(fakeSnapshot(t))
 	a.commit.publish = func(fn func()) { fn() }
 	a.tab = 2
 	a.shelfListW = 300
@@ -298,7 +316,7 @@ func TestShelfViewRenders(t *testing.T) {
 func TestBranchPopupMenu(t *testing.T) {
 	a := &app{}
 	a.commit.RepoPath = "/fake/repo"
-	a.commit.Snap = fakeSnapshot(t)
+	a.commit.Snap = vcs.WrapGit(fakeSnapshot(t))
 	a.commit.publish = func(fn func()) { fn() }
 	a.branches.lastLoaded = "/fake/repo"
 	a.branches.local = []git.Branch{
@@ -327,13 +345,12 @@ func TestBranchPopupMenu(t *testing.T) {
 	tt.CloseMenu()
 }
 
-// TestFilesPaneScrolls guards the Grow(1) fix: the file list's ScrollArea
-// must take the leftover pane height so a long list actually scrolls
-// instead of overflowing unscrollable.
+// TestFilesPaneScrolls verifies the virtual list fills the remaining
+// pane height and scrolling reveals rows outside the initial viewport.
 func TestFilesPaneScrolls(t *testing.T) {
 	a := &app{}
 	a.commit.RepoPath = "/fake/repo"
-	snap := fakeSnapshot(t)
+	snap := vcs.WrapGit(fakeSnapshot(t))
 	// Enough rows to overflow the pane.
 	for i := 0; i < 60; i++ {
 		p := "f" + string(rune('a'+i%26)) + string(rune('0'+i/26)) + ".txt"
@@ -345,12 +362,11 @@ func TestFilesPaneScrolls(t *testing.T) {
 	a.commit.Snap = snap
 	a.filesPaneW = 300
 	tt := ui.NewTester(a.view, 1080, 500)
-	if a.fileScroll.MaxY == 0 {
-		t.Fatalf("file list cannot scroll (MaxY=0): content overflows the pane")
-	}
+	firstBefore, _ := a.fileList.Visible()
 	tt.Scroll(150, 300, 0, 300)
-	if a.fileScroll.Y == 0 {
-		t.Errorf("scroll event did not move the file list: %+v", a.fileScroll)
+	firstAfter, _ := a.fileList.Visible()
+	if firstAfter <= firstBefore {
+		t.Errorf("scroll event did not move the file list: first visible %d → %d", firstBefore, firstAfter)
 	}
 }
 
@@ -360,7 +376,7 @@ func TestFilesPaneScrolls(t *testing.T) {
 func TestStagingCheckboxes(t *testing.T) {
 	a := &app{}
 	a.commit.RepoPath = "/fake/repo"
-	snap := &git.Snapshot{
+	snap := vcs.WrapGit(&git.Snapshot{
 		Worktree: "/fake/repo",
 		Files: []git.FileChange{
 			{Path: "staged1.go", Kind: git.KindAdded, IndexState: 'A'},
@@ -368,7 +384,7 @@ func TestStagingCheckboxes(t *testing.T) {
 			{Path: "unstaged1.go", Kind: git.KindModified, WorktreeState: 'M'},
 			{Path: "new.go", Kind: git.KindUntracked, WorktreeState: '?'},
 		},
-	}
+	})
 	a.commit.Snap = snap
 	m := &a.commit
 
@@ -414,13 +430,13 @@ func TestStagingCheckboxes(t *testing.T) {
 // always address a row, so we exercise the model-level decisions the
 // menu makes (which side, which kind) instead.
 func TestStagingContextMenu(t *testing.T) {
-	snap := &git.Snapshot{
+	snap := vcs.WrapGit(&git.Snapshot{
 		Files: []git.FileChange{
 			{Path: "staged.go", Kind: git.KindModified, IndexState: 'M'},
 			{Path: "work.go", Kind: git.KindModified, WorktreeState: 'M'},
 			{Path: "new.go", Kind: git.KindUntracked, WorktreeState: '?'},
 		},
-	}
+	})
 	staged := snap.Staged()
 	unstaged := snap.Unstaged()
 	if len(staged) != 1 || staged[0].Path != "staged.go" {

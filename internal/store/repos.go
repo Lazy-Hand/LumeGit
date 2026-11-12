@@ -17,18 +17,21 @@ import (
 
 // Repo describes one known repository. Path is the absolute working
 // tree; Name is its display label (defaults to the basename); Pinned
-// keeps it on top of the list; LastOpened orders recency.
+// keeps it on top of the list; LastOpened orders recency; VCSKind
+// remembers which system manages it ("git"/"svn") so the picker can
+// show the icon and skip re-detection hints.
 type Repo struct {
 	Path       string
 	Name       string
 	Pinned     bool
 	LastOpened time.Time
+	VCSKind    string // "git" | "svn" | "" (unknown / older entries)
 }
 
 // Manager loads and saves the repo list. The file lives under
 // os.UserConfigDir()/lumegit so it survives worktree deletion.
 type Manager struct {
-	path  string // JSON file path
+	path  string     // JSON file path
 	mu    sync.Mutex // guards repos + lists: shared across all app windows
 	repos []Repo
 	lists map[string]*Changelists // per-repo changelist groups
@@ -79,8 +82,10 @@ func (m *Manager) List() []Repo {
 }
 
 // Add remembers a repo. If already present, its LastOpened updates and
-// an empty Name is repaired (not overwritten).
-func (m *Manager) Add(path, name string) {
+// an empty Name is repaired (not overwritten). kind is the detected
+// VCS ("git"/"svn", "" when unknown) — once set it is never downgraded
+// back to empty by later calls that don't know it.
+func (m *Manager) Add(path, name, kind string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	path = filepath.Clean(path)
@@ -90,6 +95,9 @@ func (m *Manager) Add(path, name string) {
 			if name != "" && m.repos[i].Name == "" {
 				m.repos[i].Name = name
 			}
+			if kind != "" {
+				m.repos[i].VCSKind = kind
+			}
 			m.sort()
 			return
 		}
@@ -97,7 +105,7 @@ func (m *Manager) Add(path, name string) {
 	if name == "" {
 		name = filepath.Base(path)
 	}
-	m.repos = append(m.repos, Repo{Path: path, Name: name, LastOpened: time.Now()})
+	m.repos = append(m.repos, Repo{Path: path, Name: name, LastOpened: time.Now(), VCSKind: kind})
 	m.sort()
 }
 

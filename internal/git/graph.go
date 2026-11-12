@@ -17,6 +17,10 @@ type GraphLine struct {
 	// Edges are connector segments to draw: {fromLane,toLane} curved
 	// toward a parent that lives on another lane.
 	Edges [][2]int
+	// Joins lists other lanes that were also waiting for this commit
+	// (two children sharing a parent): each converges from the top of
+	// the row into the node and ends there.
+	Joins []int
 }
 
 // BuildGraph assigns lanes to commits so the UI can draw a graph like
@@ -27,8 +31,6 @@ func BuildGraph(commits []Commit) []GraphLine {
 		color int
 	}
 	var lanes []laneInfo
-	// oid → lane it was assigned (for the node row itself).
-	assigned := map[string]int{}
 	lines := make([]GraphLine, len(commits))
 	nextColor := 0
 
@@ -57,7 +59,16 @@ func BuildGraph(commits []Commit) []GraphLine {
 			lanes[lane].color = nextColor % 6
 			nextColor++
 		}
-		assigned[cm.OID] = lane
+		// Every other lane expecting this same commit (siblings that
+		// share it as parent) merges into the node here. Without this
+		// the extra lanes never matched again and dangled to the end of
+		// the list.
+		for j := range lanes {
+			if j != lane && lanes[j].oid == cm.OID {
+				lanes[j].oid = ""
+				gl.Joins = append(gl.Joins, j)
+			}
+		}
 		gl.Lane = lane
 		gl.ColorIdx = lanes[lane].color
 		// This lane now expects the first parent (linear continuation);
@@ -102,6 +113,5 @@ func BuildGraph(commits []Commit) []GraphLine {
 		}
 		lines[i] = gl
 	}
-	_ = assigned
 	return lines
 }

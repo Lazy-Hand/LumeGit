@@ -57,7 +57,11 @@ func (r *Repo) RefsAll(ctx context.Context) (local, remote []Branch, tags []Tag,
 		upstream, track, trackshort := f[4], f[5], f[6]
 		switch {
 		case strings.HasPrefix(refname, "refs/heads/"):
-			b := Branch{Name: short, OID: oid, Current: short == current}
+			// %(refname:short) disambiguates colliding names as
+			// "heads/x" / "tags/x"; the true name is under the full
+			// refname, which callers pass to git operations.
+			name := strings.TrimPrefix(refname, "refs/heads/")
+			b := Branch{Name: name, OID: oid, Current: name == current}
 			if upstream != "" {
 				b.Upstream = upstream
 				b.HasTrack = true
@@ -73,7 +77,7 @@ func (r *Repo) RefsAll(ctx context.Context) (local, remote []Branch, tags []Tag,
 			}
 			remote = append(remote, Branch{Name: short, OID: oid, Remote: true})
 		case strings.HasPrefix(refname, "refs/tags/"):
-			t := Tag{Name: short, OID: oid}
+			t := Tag{Name: strings.TrimPrefix(refname, "refs/tags/"), OID: oid}
 			if objtype == "tag" {
 				t.Annotated = true
 				t.Message = f[7]

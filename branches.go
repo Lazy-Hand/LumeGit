@@ -2,13 +2,25 @@ package main
 
 import (
 	"context"
+	"strings"
 
 	"lumegit/internal/git"
+	"lumegit/internal/svn"
+	"lumegit/internal/vcs"
 )
 
 // branchModel holds the Branches tab: local/remote lists and the
 // selected branch's actions. Same async pattern as the other tabs.
 type branchModel struct {
+	// Backend: nil or KindGit → git; KindSVN → svn (branch/tag = dirs).
+	backend *vcs.Backend
+
+	// svn state: the WC's repo info (root URL + current URL) and the
+	// branch/tag directory names listed from the repo.
+	svnInfo     *svn.Info
+	svnBranches []string
+	svnTags     []string
+
 	local      []git.Branch
 	remote     []git.Branch
 	tags       []git.Tag
@@ -56,9 +68,21 @@ type branchModel struct {
 	gen int
 }
 
+// setBackend records which VCS the branches model serves; called on
+// repo open. reset() clears it.
+func (b *branchModel) setBackend(be *vcs.Backend) { b.backend = be }
+
+// isSVN reports the open repo is an svn working copy.
+func (b *branchModel) isSVN() bool {
+	return b.backend != nil && b.backend.Kind == vcs.KindSVN
+}
+
 func (b *branchModel) ensureLoaded(repoPath string, w updater) {
 	if repoPath == "" || (b.lastLoaded == repoPath && !b.loading) {
 		return
+	}
+	if b.loading && b.lastLoaded == repoPath {
+		return // in-flight load — don't restart and fence it
 	}
 	b.load(repoPath, w)
 }
@@ -69,6 +93,10 @@ func (b *branchModel) load(repoPath string, w updater) {
 	b.lastLoaded = repoPath
 	b.loading = true
 	b.err = ""
+	if b.isSVN() {
+		b.svnLoad(repoPath, w, gen)
+		return
+	}
 	// Run the three queries concurrently — IDEA reads refs in one shot
 	// and never blocks the UI on serial fork/exec. The slowest call
 	// (usually worktree list on a big repo) bounds total time.
@@ -229,7 +257,122 @@ func (b *branchModel) remoteOp(repoPath string, w updater,
 func (b *branchModel) reset() {
 	b.local, b.remote = nil, nil
 	b.tags = nil
+	b.svnInfo = nil
+	b.svnBranches, b.svnTags = nil, nil
 	b.lastLoaded = ""
 	b.err = ""
+	b.backend = nil
 	b.gen++
+}
+
+// --- svn backend -------------------------------------------------------
+
+// svnLoad fills the popup from the repository's directory layout:
+// svn info tells us root + current URL, svn list reads branches/ and
+// tags/ — the two dirs SVN convention uses for branches.
+func (b *branchModel) svnLoad(repoPath string, w updater, gen int) {
+	wc := b.backend.SVN
+	go func() {
+		info, err := wc.Info(context.Background())
+		var branches, tags []string
+		if err == nil {
+			// branches/ and tags/ live at the repo root, next to trunk/.
+			base := strings.TrimSuffix(info.Root, "/")
+			branches, _ = wc.ListURL(context.Background(), base+"/branches", "immediates")
+			tags, _ = wc.ListURL(context.Background(), base+"/tags", "immediates")
+		}
+		w.update(func() {
+			if gen != b.gen {
+				return
+			}
+			b.loading = false
+			if err != nil {
+				b.err = err.Error()
+				return
+			}
+			b.err = ""
+			b.svnInfo = info
+			b.svnBranches = branches
+			b.svnTags = tags
+		})
+	}()
+}
+
+// svnCurrentURL is the WC's repo URL ("…/trunk" or "…/branches/foo").
+func (b *branchModel) svnCurrentURL() string {
+	if b.svnInfo == nil {
+		return ""
+	}
+	return b.svnInfo.URL
+}
+
+// svnRepoRoot is the repository root URL — the parent of trunk/branches.
+func (b *branchModel) svnRepoRoot() string {
+	if b.svnInfo == nil {
+		return ""
+	}
+	return strings.TrimSuffix(b.svnInfo.Root, "/")
+}
+
+// svnSwitchBranch switches the WC to another branch URL — svn's
+// checkout. After it completes the workspace's whole state changes,
+// so the commit tab refreshes too.
+func (b *branchModel) svnSwitch(repoPath, branchURL string, w updater, refresh func()) {
+	if b.busy {
+		return
+	}
+	b.busy = true
+	b.gen++
+	gen := b.gen
+	go func() {
+		res, err := b.backend.SVN.Switch(context.Background(), branchURL, svn.UpdateOptions{Accept: svn.AcceptPostpone})
+		w.update(func() {
+			if gen != b.gen {
+				return
+			}
+			b.busy = false
+			if err != nil {
+				b.err = "切换失败：" + err.Error()
+				return
+			}
+			b.err = ""
+			b.syncOK = "已切换"
+			_ = res
+			b.lastLoaded = "" // reload popup next open
+			if refresh != nil {
+				refresh()
+			}
+		})
+	}()
+}
+
+// svnNewBranch copies the current URL to branches/<name> server-side —
+// svn's "create branch". rev > 0 pins the copy source to that revision
+// (the history row's "从此修订新建分支"); 0 copies HEAD. It does not
+// switch; the user can switch after.
+func (b *branchModel) svnNewBranch(name, msg string, rev int64, w updater, done func(err string)) {
+	if b.busy || name == "" {
+		return
+	}
+	b.busy = true
+	b.gen++
+	gen := b.gen
+	src := b.svnCurrentURL()
+	dst := b.svnRepoRoot() + "/branches/" + name
+	go func() {
+		res, err := b.backend.SVN.CopyRev(context.Background(), src, dst, msg, rev)
+		w.update(func() {
+			if gen != b.gen {
+				return
+			}
+			b.busy = false
+			if err != nil {
+				done("新建分支失败：" + err.Error())
+				return
+			}
+			_ = res
+			b.lastLoaded = ""
+			done("")
+		})
+	}()
 }

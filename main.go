@@ -15,6 +15,7 @@ import (
 	updaterui "github.com/egoist/mygo/plugins/updater/native"
 	"github.com/egoist/mygo/ui"
 
+	"lumegit/components"
 	"lumegit/internal/store"
 )
 
@@ -29,6 +30,9 @@ var appCancel context.CancelFunc
 var (
 	reposStore   *store.Manager
 	reposStoreMu sync.Mutex
+
+	settingsStore   *store.SettingsManager
+	settingsStoreMu sync.Mutex
 )
 
 // sharedRepos lazily loads the store once per process.
@@ -41,9 +45,45 @@ func sharedRepos() *store.Manager {
 	return reposStore
 }
 
+// sharedSettings lazily loads the preferences file once per process.
+func sharedSettings() *store.SettingsManager {
+	settingsStoreMu.Lock()
+	defer settingsStoreMu.Unlock()
+	if settingsStore == nil {
+		settingsStore, _ = store.LoadSettings()
+	}
+	return settingsStore
+}
+
 // windowSeq gives each new window a distinct StateKey suffix so
 // positions don't fight.
 var windowSeq atomic.Int64
+
+// windows maps each live *mygo.Window to its app so app-menu clicks
+// (which receive the window, not the app) can reach the right window's
+// settings modal.
+var (
+	windowsMu sync.Mutex
+	windows   = map[*mygo.Window]*app{}
+)
+
+func registerWindow(w *mygo.Window, a *app) {
+	windowsMu.Lock()
+	windows[w] = a
+	windowsMu.Unlock()
+}
+
+func unregisterWindow(w *mygo.Window) {
+	windowsMu.Lock()
+	delete(windows, w)
+	windowsMu.Unlock()
+}
+
+func appForWindow(w *mygo.Window) *app {
+	windowsMu.Lock()
+	defer windowsMu.Unlock()
+	return windows[w]
+}
 
 func main() {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -64,6 +104,13 @@ func main() {
 			{Label: "LumeGit", Submenu: []*mygo.MenuItem{
 				{Role: mygo.RoleAbout},
 				upd.MenuItem(),
+				mygo.Separator(),
+				{Label: "偏好设置…", Accelerator: "CmdOrCtrl+,", Click: func(_ *mygo.MenuItem, w *mygo.Window) {
+					if a := appForWindow(w); a != nil {
+						a.settingsOpen = true
+						a.update(func() {})
+					}
+				}},
 				mygo.Separator(),
 				{Role: mygo.RoleServices},
 				mygo.Separator(),
@@ -99,11 +146,9 @@ func spawnWindow(openPath string) {
 		return
 	}
 	a := &app{}
-	a.filesPaneW = 280
-	a.histListW = 380
-	a.histFilesW = 260
-	a.shelfListW = 300
-	a.shelfFileW = 240
+	// Restore persisted UI prefs first; a zero field means "first run or
+	// older settings file", in which case the built-in default stands.
+	a.loadSettings()
 	a.commit.repos = sharedRepos()
 	if openPath != "" {
 		a.pickPath = openPath
@@ -111,7 +156,7 @@ func spawnWindow(openPath string) {
 
 	title := "LumeGit"
 	if openPath != "" {
-		title = fmt.Sprintf("%s — LumeGit", baseName(openPath))
+		title = fmt.Sprintf("%s — LumeGit", components.BaseName(openPath))
 	}
 	seq := windowSeq.Add(1)
 	stateKey := "main"
@@ -131,6 +176,7 @@ func spawnWindow(openPath string) {
 	a.win = win
 	a.winUpdate = win.Update
 	a.commit.publish = win.Update
+	registerWindow(win, a)
 
 	// Window focus = "user is back" — lazygit/GitHub Desktop pattern:
 	// refresh immediately so external changes (a commit made in the
@@ -148,6 +194,9 @@ func spawnWindow(openPath string) {
 		if a.commit.deadCtx != nil {
 			a.commit.deadCtx()
 		}
+		// Keep the user's pane/diff/tab choices for next launch.
+		a.saveSettings()
+		unregisterWindow(win)
 	})
 
 	if openPath != "" {

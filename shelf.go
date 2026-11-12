@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"lumegit/internal/git"
+	"lumegit/internal/vcs"
 )
 
 // shelfModel holds the Stash/Shelf tab's state: stash list, selected
@@ -34,6 +35,15 @@ type shelfModel struct {
 	lastLoaded string
 	gen        int
 	syncOK     string // transient success note
+	// svnBackend: the open repo is svn — svn has no stash, so the tab
+	// shows the empty state and skips every git call.
+	svnBackend bool
+}
+
+// setBackend records which VCS the shelf tab reads; called when the
+// repo opens.
+func (s *shelfModel) setBackend(b *vcs.Backend) {
+	s.svnBackend = b != nil && b.Kind == vcs.KindSVN
 }
 
 // ensureLoaded triggers the first load for this repo.
@@ -41,17 +51,27 @@ func (s *shelfModel) ensureLoaded(repoPath string, w updater) {
 	if repoPath == "" || (s.lastLoaded == repoPath && !s.loading) {
 		return
 	}
+	if s.loading && s.lastLoaded == repoPath {
+		return // in-flight load — don't restart and fence it
+	}
 	s.load(repoPath, w)
 }
 
 // load fetches the stash list and the patch shelf — the two queries run
-// concurrently so total time is max(stash, shelf), not their sum.
+// concurrently so total time is max(stash, shelf), not their sum. On svn
+// it short-circuits to the empty state: svn has no stash concept.
 func (s *shelfModel) load(repoPath string, w updater) {
 	s.gen++
 	gen := s.gen
 	s.lastLoaded = repoPath
 	s.loading = true
 	s.err = ""
+	if s.svnBackend {
+		s.loading = false
+		s.stashes = nil
+		s.shelf = nil
+		return
+	}
 	go func() {
 		repo := git.NewRepo(repoPath)
 		type stashResult struct {
@@ -270,5 +290,6 @@ func (s *shelfModel) reset() {
 	s.diff = nil
 	s.err = ""
 	s.lastLoaded = ""
+	s.svnBackend = false
 	s.gen++
 }

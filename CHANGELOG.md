@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.1.12] - 2026-11-12
+
+- 新增：偏好设置（菜单 LumeGit → 偏好设置…, CmdOrCtrl+,）——差异并排/统一、面板布局重置；Git 身份（本仓库 user.name/user.email）编辑
+- 新增：UI 偏好持久化到 `settings.json`（差异模式/分隔比例、五个面板宽度、所在 tab、列表/更改视图），重启保留
+- 性能：文件列表虚拟化（ui.List 只渲染可视行），2000 文件面板帧 ~16.6ms → ~0.5ms
+- 性能：diff 在后台 worker 预算行级比较（editor.DiffState 预热），选中文件首帧 1.30ms → 0.43ms；大文件自动关闭词级高亮，切换不再卡
+- 性能：变更列表分组用反向索引（原 O(文件×列表) 扫描），changelist 分配/过滤不再随仓库大小变慢
+- 修复：连续快速切换文件选择跟手（旧 diff 立即作废、不再重绘上一个文件的 DiffView）；刷新同路径 diff 时不再误用旧 DiffState
+- 修复：切换文件/提交时残留的 hunk 勾选不再被误提交；加载中隐藏 hunk 勾选条
+- 修复：重名文件重复点击不再重置比较/diff 状态造成无谓全量重算
+- 重构：可复用 UI 件抽到 `components/`（状态字形/颜色、时间/OID 格式化、graph 提交节点、placeholder、toast 栈、冲突只读列、比较单侧列表）；视图按功能拆分为 historyview/shelfview/branchview/opsdialogs/overlays/conflictview/reflogview/filehistview/diffpane，commitview.go 4707 → ~1600 行
+- 修复（此前全量审计批次）：冲突 stage 标记 `%c`→`%d`（"采用当前/对方"此前必失败）、rebase `--only` 修正、push.default 语义、status `-unormal`、shelf 暂存/未跟踪搁置、filehist 懒加载 blame、提交回滚路径引用安全等
+- 移除：PLAN_P0–P3 计划文档（已落地的临时文件）
+
 ## [0.1.11] - 2026-11-11
 
 - 修复：「与当前分支比较」文件列表三点 → 两点 diff，与点开后看到的差异一致（原来列表能列出两端内容相同的文件，打开是空白）

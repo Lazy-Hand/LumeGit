@@ -71,7 +71,11 @@ func (r *Repo) DeleteTag(ctx context.Context, name string) (*RunResult, error) {
 // PushTag pushes one tag to a remote (git push <remote> <name>).
 func (r *Repo) PushTag(ctx context.Context, remote, name string) (*RunResult, error) {
 	if remote == "" {
-		remote = "origin"
+		rm, err := r.PushRemote(ctx)
+		if err != nil {
+			return nil, err
+		}
+		remote = rm
 	}
 	return r.RunOK(ctx, "push", remote, "refs/tags/"+name)
 }

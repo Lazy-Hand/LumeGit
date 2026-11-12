@@ -1,9 +1,11 @@
 package git
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 )
 
@@ -16,6 +18,11 @@ var ErrStagedChangesPending = errors.New("staged changes exist; changelist commi
 // ErrConflictInProgress reports unresolved conflicts or a sequencer
 // operation mid-flight; a plain commit is unsafe there.
 var ErrConflictInProgress = errors.New("in-progress operation or conflicts; resolve before committing")
+
+// ErrPartialStale reports that a file changed after the user picked its
+// hunks: the selection indexes into a hunk list that no longer matches
+// the worktree, so staging it could commit the wrong lines.
+var ErrPartialStale = errors.New("文件在选择 hunk 之后已变化，请重新选择要提交的 hunk")
 
 // ErrNotCleanState reports that repo state changed between the
 // snapshot the user reviewed and the commit attempt.
@@ -36,10 +43,16 @@ type CommitRequest struct {
 	// the diff view — chosen[i]==true stages hunk i. Files here are
 	// staged via `git apply --cached` of a partial patch instead of the
 	// blanket `git add`, so unselected hunks stay unstaged.
-	Partial  map[string][]bool
-	Message  string
-	Amend    bool
-	NoVerify bool // -n: skip pre-commit/commit-msg hooks (IDEA's "Skip Git hooks")
+	Partial map[string][]bool
+	// PartialHunks optionally carries the hunk list each Partial
+	// selection was made against (what the diff view showed). When set,
+	// Commit re-reads the file's hunks and refuses with ErrPartialStale
+	// if they differ — indexes into a changed list would stage the
+	// wrong hunks silently.
+	PartialHunks map[string][]Hunk
+	Message      string
+	Amend        bool
+	NoVerify     bool // -n: skip pre-commit/commit-msg hooks (IDEA's "Skip Git hooks")
 }
 
 // Commit performs a changelist-mode selective commit.
@@ -69,36 +82,8 @@ func (r *Repo) Commit(ctx context.Context, req CommitRequest) (*CommitOutcome, e
 		return nil, fmt.Errorf("commit: resolve HEAD: %w", err)
 	}
 
-	// Split the path list: partial-hunk files get a patch apply, the
-	// rest a blanket add.
-	var fullPaths []string
-	for _, p := range req.Paths {
-		if _, ok := req.Partial[p]; !ok {
-			fullPaths = append(fullPaths, p)
-		}
-	}
-	if len(req.Untracked) > 0 || len(fullPaths) > 0 {
-		stageArgs := []string{"add"}
-		for _, u := range req.Untracked {
-			stageArgs = append(stageArgs, u)
-		}
-		stageArgs = append(stageArgs, "--")
-		stageArgs = append(stageArgs, fullPaths...)
-		if res, serr := r.RunOK(ctx, stageArgs...); serr != nil {
-			return nil, fmt.Errorf("commit: stage selection: %w", serr)
-		} else if !res.ExitOK() {
-			return nil, &GitError{Args: stageArgs, Stderr: res.OutputOfStderr()}
-		}
-	}
-	// Partial selections: stage only the chosen hunks of each file.
-	for path, chosen := range req.Partial {
-		if perr := r.StageHunks(ctx, path, chosen); perr != nil {
-			return nil, fmt.Errorf("commit: stage hunks of %s: %w", path, perr)
-		}
-	}
-
-	// Verify: index diff vs HEAD must mention exactly the staged set —
-	// nothing else slipped into the index while staging.
+	// The selection to verify against: exactly these paths must reach
+	// the index, nothing else.
 	expected := map[string]bool{}
 	for _, p := range req.Untracked {
 		expected[p] = true
@@ -106,7 +91,59 @@ func (r *Repo) Commit(ctx context.Context, req CommitRequest) (*CommitOutcome, e
 	for _, p := range req.Paths {
 		expected[p] = true
 	}
-	res2, err := r.RunOK(ctx, "diff", "--cached", "--name-only", "-z")
+	for p := range req.Partial {
+		if !expected[p] {
+			return nil, fmt.Errorf("commit: partial selection for unselected path %q", p)
+		}
+	}
+
+	// From here on the index holds our staging. Any failure (verify,
+	// HEAD moved, hook rejection) must hand the index back to the tree
+	// it held before we touched it — checkPreCommitState guaranteed
+	// that tree equals HEAD's, so reset-to-HEAD on exactly our paths is
+	// the honest restore. read-tree was considered and rejected: it
+	// accepts no pathspecs, so it would clobber the whole index —
+	// including entries another process staged concurrently. reset is
+	// scoped to our paths; a concurrent stager's entries survive.
+	committed := false
+	defer func() {
+		if !committed {
+			r.rollbackStaged(context.WithoutCancel(ctx), beforeOID == "", sortedKeys(expected))
+		}
+	}()
+
+	// Split the path list: partial-hunk files get a patch apply, the
+	// rest a blanket add. Untracked paths go after "--" too: a file
+	// named "-A" must stay a pathspec, not become an option. Literal
+	// pathspecs keep glob characters ([?*) in filenames from widening
+	// the staged set — the verify step would reject extras anyway, but
+	// literal paths are also the honest semantic.
+	var fullPaths []string
+	for _, p := range req.Paths {
+		if _, ok := req.Partial[p]; !ok {
+			fullPaths = append(fullPaths, p)
+		}
+	}
+	if len(req.Untracked) > 0 || len(fullPaths) > 0 {
+		stageArgs := []string{"add", "--"}
+		stageArgs = append(stageArgs, literalPathspecs(req.Untracked)...)
+		stageArgs = append(stageArgs, literalPathspecs(fullPaths)...)
+		if _, serr := r.RunOK(ctx, stageArgs...); serr != nil {
+			return nil, fmt.Errorf("commit: stage selection: %w", serr)
+		}
+	}
+	// Partial selections: stage only the chosen hunks of each file.
+	for path, chosen := range req.Partial {
+		if perr := r.stagePartial(ctx, path, chosen, req.PartialHunks[path]); perr != nil {
+			return nil, fmt.Errorf("commit: stage hunks of %s: %w", path, perr)
+		}
+	}
+
+	// Verify: index diff vs HEAD must mention exactly the staged set —
+	// nothing else slipped into the index while staging. --no-renames:
+	// with rename detection a committed rename (delete a + add b) lists
+	// only b, and a would wrongly count as "did not reach the index".
+	res2, err := r.RunOK(ctx, "diff", "--cached", "--name-only", "--no-renames", "-z")
 	if err != nil {
 		return nil, fmt.Errorf("commit: verify staged set: %w", err)
 	}
@@ -160,8 +197,74 @@ func (r *Repo) Commit(ctx context.Context, req CommitRequest) (*CommitOutcome, e
 	}
 	if !cRes.ExitOK() {
 		outcome.Error = &GitError{Args: commitArgs, Stderr: cRes.OutputOfStderr()}
+	} else {
+		committed = true
 	}
 	return outcome, nil
+}
+
+// stagePartial stages the chosen hunks of path. seen, when non-nil, is
+// the hunk list the selection was made against; a mismatch with the
+// file's current hunks means the indexes no longer point at the hunks
+// the user ticked.
+func (r *Repo) stagePartial(ctx context.Context, path string, chosen []bool, seen []Hunk) error {
+	hunks, err := r.FileHunks(ctx, path)
+	if err != nil {
+		return err
+	}
+	if len(hunks) == 0 {
+		return fmt.Errorf("%s: no hunks (new/deleted/binary file?)", path)
+	}
+	if seen != nil && !sameHunks(seen, hunks) {
+		return ErrPartialStale
+	}
+	if len(chosen) != len(hunks) {
+		return ErrPartialStale
+	}
+	patch, err := SelectedPatch(path, nil, hunks, chosen)
+	if err != nil {
+		return err
+	}
+	return r.ApplyToIndex(ctx, patch)
+}
+
+func sameHunks(a, b []Hunk) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].Header != b[i].Header || !bytes.Equal(a[i].Lines, b[i].Lines) {
+			return false
+		}
+	}
+	return true
+}
+
+// rollbackStaged un-stages exactly the paths we staged, restoring each
+// index entry to its HEAD version. The worktree is never touched. On an
+// unborn branch there is no HEAD, so the entries are dropped from the
+// index instead. Literal pathspecs keep glob characters in filenames
+// from widening the restore. A path another process re-staged after our
+// staging may briefly carry their version — unavoidable without locks,
+// and narrower than the alternatives (read-tree takes no pathspecs).
+// Best effort: the commit error is what the user needs to see.
+func (r *Repo) rollbackStaged(ctx context.Context, unborn bool, paths []string) {
+	if unborn {
+		args := append([]string{"rm", "--cached", "-r", "-q", "--ignore-unmatch", "--"}, literalPathspecs(paths)...)
+		_, _ = r.Run(ctx, args...)
+		return
+	}
+	args := append([]string{"reset", "-q", "HEAD", "--"}, literalPathspecs(paths)...)
+	_, _ = r.Run(ctx, args...)
+}
+
+func sortedKeys(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // CommitOutcome reports what actually happened, including when the

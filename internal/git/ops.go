@@ -39,7 +39,7 @@ func (r *Repo) Reset(ctx context.Context, target string, mode ResetMode) (*RunRe
 	if mode == "" {
 		mode = ResetMixed
 	}
-	return r.Run(ctx, "reset", string(mode), target)
+	return r.Run(ctx, "reset", string(mode), target, "--")
 }
 
 // UndoHeadCommit reverses the HEAD commit only (git reset --soft
@@ -53,21 +53,28 @@ func (r *Repo) UndoHeadCommit(ctx context.Context) (*RunResult, error) {
 // -m). For a non-HEAD commit the caller routes through the rebase plan
 // (reword) instead — this is the fast path for the top commit only.
 func (r *Repo) AmendMessage(ctx context.Context, msg string) (*RunResult, error) {
-	return r.Run(ctx, "commit", "--amend", "-m", msg)
+	return r.Run(ctx, "commit", "--amend", "--only", "-m", msg)
 }
 
 // PushUpTo pushes the current branch's history up to (and including)
 // oid — IDEA's "Push all commits up to here". It maps to
 // `git push <remote> <oid>:refs/heads/<branch>`.
 func (r *Repo) PushUpTo(ctx context.Context, oid, remote string) (*RunResult, error) {
-	if remote == "" {
-		remote = "origin"
+	// oid must be an ancestor of the current branch's HEAD — pushing a
+	// commit that only exists on another branch would move this remote
+	// ref to history the user isn't on.
+	if ok, err := r.IsAncestor(ctx, oid, "HEAD"); err != nil {
+		return &RunResult{}, fmt.Errorf("推送此前提交：无法校验提交归属: %w", err)
+	} else if !ok {
+		return &RunResult{}, fmt.Errorf("该提交不属于当前分支，不能从此处推送")
 	}
-	head, err := r.headName(ctx)
-	if err != nil || head == "" {
-		return &RunResult{}, fmt.Errorf("分离 HEAD 不能推送分支")
+	tgt, err := r.resolvePushTarget(ctx, remote)
+	if err != nil {
+		return &RunResult{}, err
 	}
-	return r.Run(ctx, "push", remote, oid+":refs/heads/"+head)
+	// Same destination a plain push would update (upstream branch,
+	// which may be named differently or live on another remote).
+	return r.Run(ctx, "push", tgt.Remote, oid+":"+tgt.Ref)
 }
 
 // OpOutput renders a RunResult for the operation log.

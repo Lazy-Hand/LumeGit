@@ -23,6 +23,14 @@ type ConflictDiff struct {
 	Base  []byte // common ancestor (stage 1)
 	Ours  []byte // current branch (stage 2)
 	Their []byte // incoming side (stage 3)
+
+	// TreeConflict marks an svn tree conflict — no .mine/.rN side files
+	// exist, so Base/Ours/Their are all empty and a "save merged text"
+	// would only write an empty file. The resolver hides side-picking
+	// and merge-save for these; the user resolves via svn's own accept
+	// choices (or the entry list's ours/theirs buttons which map to
+	// mine-full/theirs-full).
+	TreeConflict bool
 }
 
 // Conflicts returns the files still in conflict from the snapshot.
@@ -98,10 +106,25 @@ func (r *Repo) ResolveConflict(ctx context.Context, path string, how ConflictRes
 	switch how {
 	case ResolveOurs, ResolveTheirs:
 		flag := "--ours"
+		want := uint8(2)
 		if how == ResolveTheirs {
 			flag = "--theirs"
+			want = 3
 		}
-		res, err := r.RunOK(ctx, "checkout", flag, "--", path)
+		// A delete/modify conflict has no stage for the deleting side;
+		// git checkout --ours/--theirs fails there — resolve by removing
+		// the file instead of erroring out.
+		has, err := r.hasConflictStage(ctx, path, want)
+		if err != nil {
+			return err
+		}
+		if !has {
+			if err := r.resolveDelete(ctx, path); err != nil {
+				return err
+			}
+			break
+		}
+		res, err := r.RunOK(ctx, "checkout", flag, "--", literalPathspec(path))
 		if err != nil {
 			return err
 		}
@@ -110,12 +133,64 @@ func (r *Repo) ResolveConflict(ctx context.Context, path string, how ConflictRes
 		}
 	case ResolveMerge:
 		full := filepath.Join(r.Worktree, path)
-		if err := os.WriteFile(full, merged, 0o644); err != nil {
-			return fmt.Errorf("write merged file: %w", err)
+		// Never write through a symlink — a conflicted link pointing at
+		// another file would overwrite the TARGET. For links, write the
+		// link text and stage the link itself.
+		var st os.FileInfo
+		var lerr error
+		st, lerr = os.Lstat(full)
+		if lerr == nil && st.Mode()&os.ModeSymlink != 0 {
+			if serr := os.Remove(full); serr != nil {
+				return fmt.Errorf("replace symlink: %w", serr)
+			}
+			if serr := os.Symlink(string(merged), full); serr != nil {
+				return fmt.Errorf("write symlink target: %w", serr)
+			}
+		} else {
+			if err := os.WriteFile(full, merged, 0o644); err != nil {
+				return fmt.Errorf("write merged file: %w", err)
+			}
 		}
 	}
 	// Mark resolved.
-	res, err := r.RunOK(ctx, "add", "--", path)
+	res, err := r.RunOK(ctx, "add", "--", literalPathspec(path))
+	if err != nil {
+		return err
+	}
+	if !res.ExitOK() {
+		return &GitError{Args: res.Args, Stderr: res.OutputOfStderr()}
+	}
+	return nil
+}
+
+// hasConflictStage reports whether the index still carries the given
+// stage entry for path (2=ours, 3=theirs). False means that side
+// deleted the file.
+func (r *Repo) hasConflictStage(ctx context.Context, path string, stage byte) (bool, error) {
+	res, err := r.Run(ctx, "ls-files", "-u", "-z", "--", path)
+	if err != nil {
+		return false, err
+	}
+	if !res.ExitOK() {
+		return false, &GitError{Args: []string{"ls-files", "-u"}, Stderr: res.OutputOfStderr()}
+	}
+	want := fmt.Sprintf("%d", stage)
+	for _, rec := range strings.Split(string(res.Stdout), "\x00") {
+		if rec == "" {
+			continue
+		}
+		f := strings.Fields(rec)
+		if len(f) >= 3 && f[2] == want {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// resolveDelete marks a file resolved by removing it — the correct
+// answer when the chosen side of a delete/modify conflict deleted it.
+func (r *Repo) resolveDelete(ctx context.Context, path string) error {
+	res, err := r.RunOK(ctx, "rm", "-f", "--", literalPathspec(path))
 	if err != nil {
 		return err
 	}

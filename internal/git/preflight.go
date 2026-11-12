@@ -3,7 +3,6 @@ package git
 import (
 	"context"
 	"fmt"
-	"strings"
 )
 
 // checkPreCommitState implements the pre-commit gate: staged content,
@@ -29,21 +28,4 @@ func (r *Repo) checkPreCommitState(ctx context.Context) error {
 		}
 	}
 	return nil
-}
-
-// treeOID returns HEAD's tree object id ("" for unborn HEAD).
-func (r *Repo) treeOID(ctx context.Context) (string, error) {
-	res, err := r.Run(ctx, "rev-parse", "HEAD^{tree}")
-	if err != nil {
-		return "", err
-	}
-	if !res.ExitOK() {
-		// Unborn HEAD has no tree.
-		if strings.Contains(res.OutputOfStderr(), "unknown revision") ||
-			strings.Contains(res.OutputOfStderr(), "bad revision") {
-			return "", nil
-		}
-		return "", &GitError{Args: []string{"rev-parse", "HEAD^{tree}"}, Stderr: res.OutputOfStderr()}
-	}
-	return strings.TrimSpace(res.Output()), nil
 }

@@ -56,7 +56,7 @@ func isCatFileMissing(err error) bool {
 // name files whose ref:path and HEAD:path blobs are identical, which
 // opened to an empty diff — the "loads then nothing" bug.)
 func (r *Repo) CompareFiles(ctx context.Context, ref string) ([]CommitFile, error) {
-	res, err := r.Run(ctx, "diff", "--name-status", "-z", ref, "HEAD")
+	res, err := r.Run(ctx, "diff", "--name-status", "-z", ref, "HEAD", "--")
 	if err != nil {
 		return nil, err
 	}
@@ -86,20 +86,34 @@ func (r *Repo) CompareFilesWorktree(ctx context.Context, ref, path string) ([]Co
 }
 
 // CompareCommitsDiff returns the file-level diff of one path between
-// two committed refs (IDEA: compare any two commits/branches).
-func (r *Repo) CompareCommitsDiff(ctx context.Context, fromRef, toRef, path string) (*DiffInfo, error) {
+// two committed refs (IDEA: compare any two commits/branches). For a
+// renamed file origPath names the pre-rename path — the old side must
+// read fromRef:origPath or the blob lookup 404s into an "added file".
+// A side whose blob is absent reads as empty (added/deleted file), not
+// an error.
+func (r *Repo) CompareCommitsDiff(ctx context.Context, fromRef, toRef, path, origPath string) (*DiffInfo, error) {
 	info := &DiffInfo{
 		Path:     path,
 		OldLabel: fromRef,
 		NewLabel: toRef,
 	}
-	old, err := r.catFile(ctx, fromRef+":"+path)
+	oldPath := path
+	if origPath != "" {
+		oldPath = origPath
+	}
+	old, err := r.catFile(ctx, fromRef+":"+oldPath)
 	if err != nil {
-		return nil, err
+		if !isCatFileMissing(err) {
+			return nil, err
+		}
+		old = nil
 	}
 	newB, err := r.catFile(ctx, toRef+":"+path)
 	if err != nil {
-		return nil, err
+		if !isCatFileMissing(err) {
+			return nil, err
+		}
+		newB = nil
 	}
 	info.Old, info.New = old, newB
 	info.Binary = looksBinary(old) || looksBinary(newB)
@@ -190,7 +204,7 @@ func (r *Repo) logRange(ctx context.Context, rng string, max int) ([]Commit, err
 // compareTwoRefs returns the name-status diff from→to (NUL-separated,
 // matching parseNameStatus).
 func (r *Repo) compareTwoRefs(ctx context.Context, from, to string) ([]CommitFile, error) {
-	res, err := r.Run(ctx, "diff", "--name-status", "-z", from, to)
+	res, err := r.Run(ctx, "diff", "--name-status", "-z", from, to, "--")
 	if err != nil {
 		return nil, err
 	}
@@ -203,7 +217,7 @@ func (r *Repo) compareTwoRefs(ctx context.Context, from, to string) ([]CommitFil
 // ChangedBetween lists paths changed ref→worktree (uncommitted), i.e.
 // "what would comparing show" for a whole-file scope.
 func (r *Repo) ChangedBetween(ctx context.Context, ref string) ([]string, error) {
-	res, err := r.Run(ctx, "diff", "--name-only", ref)
+	res, err := r.Run(ctx, "diff", "--name-only", ref, "--")
 	if err != nil {
 		return nil, err
 	}

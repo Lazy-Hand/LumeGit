@@ -103,11 +103,19 @@ func (r *Repo) FileDiff(ctx context.Context, req FileDiffRequest) (*DiffInfo, er
 		info.Binary = line.binary
 	} else {
 		// No numstat line at all: untracked or index-absent path — git
-		// shows nothing for untracked in any diff form. Sniff the
-		// worktree bytes ourselves; the UI shows a binary marker.
-		if b, rerr := readWorktreeFile(ctx, r, req.Path); rerr == nil {
+		// shows nothing for untracked in any diff form. Sniff a bounded
+		// worktree prefix ourselves; the UI shows a binary marker and
+		// never renders the bytes anyway.
+		if b, rerr := readWorktreeFileHead(ctx, r, req.Path, sniffBytes); rerr == nil {
 			info.Binary = looksBinary(b)
 		}
+	}
+	// A binary diff never renders Old/New — stop before pulling full
+	// blobs/worktree bytes (a multi-hundred-MB asset used to be read
+	// three times: once to sniff, once for the "new" side, once in
+	// Old). Binary check above already did the bounded read.
+	if info.Binary {
+		return info, nil
 	}
 	// Renames: only relevant when HEAD→index or HEAD→worktree with
 	// rename detection enabled at status level; we trust the snapshot's

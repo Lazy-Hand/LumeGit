@@ -21,7 +21,7 @@ type Hunk struct {
 // the granularity IDEA's per-chunk checkboxes operate on.
 // Returns nil for new/deleted/binary files (whole-file only).
 func (r *Repo) FileHunks(ctx context.Context, path string) ([]Hunk, error) {
-	res, err := r.Run(ctx, "diff", "--no-color", "-U3", "--", path)
+	res, err := r.Run(ctx, "diff", "--no-color", "-U3", "--", literalPathspec(path))
 	if err != nil {
 		return nil, err
 	}

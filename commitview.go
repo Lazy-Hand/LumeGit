@@ -3,9 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
-	"os"
 	"os/exec"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -21,8 +19,10 @@ import (
 	"github.com/lobehub/lobe-mygo/pkg/layout"
 	"github.com/lobehub/lobe-mygo/pkg/theme"
 
+	"lumegit/components"
 	"lumegit/internal/git"
 	"lumegit/internal/store"
+	"lumegit/internal/vcs"
 )
 
 // appCTX is the shared background context for git work. Set to a
@@ -50,14 +50,14 @@ type app struct {
 	win       *mygo.Window    // used for dialog parenting; nil in tests
 
 	// Layout persistence.
-	filesPaneW  float32
-	histListW   float32 // history: commit-list pane width
-	histFilesW  float32 // history: file-list pane width
-	shelfListW  float32 // shelf: stash-list pane width
-	shelfFileW  float32 // shelf: file-list pane width
+	filesPaneW float32
+	histListW  float32 // history: commit-list pane width
+	histFilesW float32 // history: file-list pane width
+	shelfListW float32 // shelf: stash-list pane width
+	shelfFileW float32 // shelf: file-list pane width
 	// (branchListW removed: the branches popup replaced the list pane)
-	diffSplit   float32
-	diffMode    int // 0 = split, 1 = unified
+	diffSplit float32
+	diffMode  int // 0 = split, 1 = unified
 
 	// Main tab: 0=提交, 1=历史, 2=搁置.
 	tab int
@@ -84,19 +84,35 @@ type app struct {
 	amendOID   string // commit being amended (must be HEAD)
 	amendInput string // new message
 
+	// svn "新建分支" dialog — copies current URL → branches/<name>.
+	svnNewBranchOpen bool
+	svnNewBranchName string
+	svnNewBranchErr  string
+	svnNewBranchRev  int64 // >0: pin the copy to this rev (history right-click)
+
 	// "推送此前所有提交…" dialog (IDEA: Push up to here).
-	pushUpToOpen bool
-	pushUpToOID  string // last commit to include
+	pushUpToOpen  bool
+	pushUpToOID   string // last commit to include
 	pushUpToShort string // display-only short OID
 
 	// Diff state for the current file, rebuilt per selection.
 	diffState    *editor.DiffState
+	diffStateFor *git.DiffInfo     // content identity; refreshes can replace a diff for the same path
 	fhDiffState  *editor.DiffState // separate state for the file-history overlay
 	cmpDiffState *editor.DiffState // separate state for the compare overlay
 
-	// fileScroll tracks the commit file list's scroll offset so tests
-	// (and future "scroll to top" actions) can read and drive it.
-	fileScroll ui.ScrollState
+	// fileList virtualizes the grouped changes list, including headers.
+	fileList ui.ListState
+
+	// settingsOpen drives the 偏好设置 modal (menu: LumeGit → 偏好设置…,
+	// CmdOrCtrl+,).
+	settingsOpen bool
+	// Git identity fields in the settings modal, loaded when it opens.
+	gitName, gitEmail string // editable local user.name / user.email
+	gitGlobalName     string // read-only global fallback, shown as hint
+	gitGlobalEmail    string
+	gitIdentityErr    string
+	gitIdentityLoaded bool
 }
 
 // updater is the model's publication channel, plus toasts.
@@ -112,6 +128,59 @@ func (a *app) update(fn func()) {
 		return
 	}
 	fn()
+}
+
+// loadSettings applies persisted UI prefs at window start. Every field
+// guards a zero value so a missing/old settings file falls back to the
+// built-in defaults, and a window reopened from the picker keeps the
+// last session's layout instead of the fresh-window constants.
+func (a *app) loadSettings() {
+	mgr := sharedSettings()
+	if mgr == nil {
+		// Config dir unreadable: run with defaults, don't block startup.
+		a.filesPaneW, a.histListW, a.histFilesW = 280, 380, 260
+		a.shelfListW, a.shelfFileW = 300, 240
+		return
+	}
+	s := mgr.Get()
+	a.filesPaneW = orFloat(s.FilesPaneW, 280)
+	a.histListW = orFloat(s.HistListW, 380)
+	a.histFilesW = orFloat(s.HistFilesW, 260)
+	a.shelfListW = orFloat(s.ShelfListW, 300)
+	a.shelfFileW = orFloat(s.ShelfFileW, 240)
+	a.diffMode = s.DiffMode
+	a.diffSplit = s.DiffSplit
+	a.tab = s.Tab
+	a.commit.mode = s.CommitMode
+}
+
+// saveSettings writes the current UI prefs. Called on window close;
+// the store serializes the write so several windows exiting at once
+// can't tear the file.
+func (a *app) saveSettings() {
+	mgr := sharedSettings()
+	if mgr == nil {
+		return
+	}
+	_ = mgr.Save(store.Settings{
+		DiffMode:   a.diffMode,
+		DiffSplit:  a.diffSplit,
+		FilesPaneW: a.filesPaneW,
+		HistListW:  a.histListW,
+		HistFilesW: a.histFilesW,
+		ShelfListW: a.shelfListW,
+		ShelfFileW: a.shelfFileW,
+		Tab:        a.tab,
+		CommitMode: a.commit.mode,
+	})
+}
+
+// orFloat returns def when v is zero (settings not set yet).
+func orFloat(v, def float32) float32 {
+	if v == 0 {
+		return def
+	}
+	return v
 }
 
 // view renders the whole window each frame.
@@ -147,8 +216,11 @@ func (a *app) view(c *ui.Context) {
 	if a.commit.lfsLocksOpen {
 		a.lfsLocksOverlay(c, t)
 	}
-	// LFS data load (cheap after first fetch).
-	a.commit.loadLFS(a.updater())
+	// LFS data load (cheap after first fetch; svn has no LFS — skip so
+	// an svn WC never sees "git lfs" errors in the corner).
+	if !a.commit.isSVN() {
+		a.commit.loadLFS(a.updater())
+	}
 	// Branch/rebase target dialog.
 	if a.branchDialogOpen {
 		a.branchDialog(c, t)
@@ -193,6 +265,13 @@ func (a *app) view(c *ui.Context) {
 	if a.pushUpToOpen {
 		a.pushUpToDialog(c, t)
 	}
+	if a.svnNewBranchOpen {
+		a.svnNewBranchDialog(c, t)
+	}
+	// svn:ignore 列表（svn 没有 .gitignore，属性散在各目录上）。
+	if a.commit.ignoreOpen {
+		a.svnIgnoreDialog(c, t)
+	}
 	// Branch-compare overlay.
 	if a.compare.open {
 		a.compareOverlay(c, t)
@@ -200,6 +279,10 @@ func (a *app) view(c *ui.Context) {
 	// Go-to commit/tag dialog.
 	if a.history.gotoOpen {
 		a.gotoDialogView(c, t)
+	}
+	// Preferences on top of all panes (still under toasts).
+	if a.settingsOpen {
+		a.settingsView(c, t)
 	}
 	// Transient notifications on top of everything.
 	a.toastLayer(c, t)
@@ -261,10 +344,10 @@ func (a *app) pickView(c *ui.Context, t *ui.Theme) {
 					Placeholder: "/path/to/repo",
 					Size:        theme.Middle,
 				}).Width(320).OnSubmit(func() {
-						if p := strings.TrimSpace(a.pickPath); p != "" {
-							spawnWindow(p)
-						}
-					})
+					if p := strings.TrimSpace(a.pickPath); p != "" {
+						spawnWindow(p)
+					}
+				})
 				action.Button(c, "打开…", action.ButtonProps{Variant: action.Primary, Size: theme.Middle}).
 					OnClick(a.browseAndOpenNewWindow)
 				action.Button(c, "打开", action.ButtonProps{Variant: action.Default, Size: theme.Middle}).
@@ -304,7 +387,7 @@ func (a *app) openPickedRepo() {
 	a.commit.setBusy(w, true, "正在打开仓库…")
 	openPath := dir
 	go func() {
-		snap, worktree, cerr := openRepo(appCTX, openPath)
+		snap, backend, cerr := openRepo(appCTX, openPath)
 		w.update(func() {
 			if gen != a.commit.gen {
 				return
@@ -314,16 +397,44 @@ func (a *app) openPickedRepo() {
 				a.commit.openErr = cerr.Error()
 				return
 			}
-			a.pickPath = worktree
-			a.commit.RepoPath = worktree
+			if a.commit.diffCancel != nil {
+				a.commit.diffCancel()
+				a.commit.diffCancel = nil
+			}
+			a.commit.diffGen++
+			a.commit.selectedFile = ""
+			a.commit.diff = nil
+			a.commit.diffPrepared = nil
+			a.commit.diffPath = ""
+			a.commit.diffErr = ""
+			a.commit.diffLoading = false
+			a.commit.hunks = nil
+			a.commit.hunkCheck = nil
+			a.diffState = nil
+			a.diffStateFor = nil
+			a.fileList = ui.ListState{}
+			a.pickPath = backend.Root
+			a.commit.RepoPath = backend.Root
+			a.commit.VCS = backend
 			a.commit.Snap = snap
 			a.commit.openErr = ""
+			// -uno is a per-repo degradation — a flood in the last repo
+			// must not hide this repo's untracked files.
+			a.commit.preferNoUntracked = false
 			a.history.reset()
+			a.history.setBackend(backend)
 			a.shelf.reset()
+			a.shelf.setBackend(backend)
 			a.branches.reset()
+			a.branches.setBackend(backend)
+			a.fileHist.reset()
+			a.fileHist.setBackend(backend)
+			a.conflict.setBackend(backend)
+			a.conflicts.setBackend(backend)
+			a.compare.setBackend(backend)
 			if a.commit.repos != nil {
-				a.commit.repos.Add(worktree, "")
-				a.commit.lists = a.commit.repos.ChangelistsFor(worktree)
+				a.commit.repos.Add(backend.Root, "", string(backend.Kind))
+				a.commit.lists = a.commit.repos.ChangelistsFor(backend.Root)
 				a.saveRepos()
 			}
 			a.commit.reconcileLists()
@@ -344,9 +455,9 @@ func (a *app) openPickedRepo() {
 			// Warm the other tabs' caches: each loader spawns its own
 			// worker and returns at once, so the three git reads run
 			// concurrently while the UI is already showing 提交.
-			a.history.ensureLoaded(worktree, w)
-			a.shelf.ensureLoaded(worktree, w)
-			a.branches.ensureLoaded(worktree, w)
+			a.history.ensureLoaded(backend.Root, w)
+			a.shelf.ensureLoaded(backend.Root, w)
+			a.branches.ensureLoaded(backend.Root, w)
 		})
 	}()
 }
@@ -355,7 +466,7 @@ func (a *app) openPickedRepo() {
 func (a *app) repoRowView(c *ui.Context, r store.Repo) {
 	selected := a.commit.RepoPath == r.Path
 	row := ui.Row(c).Key("repo-"+r.Path).FillWidth().Padding(8, 16).Gap(8).AlignItems(ui.Center).
-		Background(rowBg(c.Theme(), selected))
+		Background(components.RowBg(c.Theme(), selected))
 	row.Children(func() {
 		if r.Pinned {
 			ui.Text(c, "📌").FontSize(11)
@@ -451,13 +562,22 @@ func (a *app) commitView(c *ui.Context, t *ui.Theme) {
 	ui.Column(c).Fill().Background(tk.BgLayout).Children(func() {
 		a.headerView(c, t)
 		ui.Row(c).Padding(4, 16).Background(tk.BgContainer).Children(func() {
-			action.Segmented(c, &a.tab, []string{"提交", "历史", "搁置"}, action.SegmentedProps{Size: theme.Small})
+			// svn has no stash — hide the shelf tab on an svn WC so the
+			// user can't land on a page that only runs git stash.
+			if a.commit.isSVN() {
+				action.Segmented(c, &a.tab, []string{"提交", "历史"}, action.SegmentedProps{Size: theme.Small})
+				if a.tab > 1 {
+					a.tab = 0
+				}
+			} else {
+				action.Segmented(c, &a.tab, []string{"提交", "历史", "搁置"}, action.SegmentedProps{Size: theme.Small})
+			}
 		})
 		if a.tab == 1 {
 			a.historyView(c, t)
 			return
 		}
-		if a.tab == 2 {
+		if a.tab == 2 && !a.commit.isSVN() {
 			a.shelfView(c, t)
 			return
 		}
@@ -681,7 +801,7 @@ func (a *app) headerView(c *ui.Context, t *ui.Theme) {
 	m := &a.commit
 	tk := theme.TokensOf(c)
 	ui.Row(c).Padding(10, 16).Gap(12).AlignItems(ui.Center).Background(tk.BgContainer).Children(func() {
-		ui.Text(c, baseName(m.RepoPath)).Bold()
+		ui.Text(c, components.BaseName(m.RepoPath)).Bold()
 		// IDEA-style "open recent in new window" — each window owns one
 		// repo, so switching means spawning a new window, not reusing this.
 		action.Button(c, "⌄", action.ButtonProps{Variant: action.Text, Size: theme.Small}).
@@ -707,34 +827,44 @@ func (a *app) headerView(c *ui.Context, t *ui.Theme) {
 				}
 			})
 		if m.Snap != nil {
-			branch := m.Snap.HeadName
-			if m.Snap.Detached {
-				// IDEA shows "DETACHED HEAD @ <oid>" and offers a one-click
-				// "create branch here" — surface the same.
-				branch = "DETACHED @ " + shortOID(m.Snap.HeadOID)
-			}
-			if m.Snap.Unborn {
-				branch += " (未提交)"
+			branch := m.Snap.Head // git branch name, or svn's URL tail
+			if gs := m.Snap.Git; gs != nil {
+				if gs.Detached {
+					// IDEA shows "DETACHED HEAD @ <oid>" and offers a
+					// one-click "create branch here" — surface the same.
+					branch = "DETACHED @ " + components.ShortOID(gs.HeadOID)
+				}
+				if gs.Unborn {
+					branch += " (未提交)"
+				}
 			}
 			// IDEA Branches popup: clicking the current-branch tag opens the
 			// whole ref tree as a menu — checkout/merge/delete per branch.
 			display.Tag(c, branch, display.TagProps{Variant: display.TagOutlined, Color: display.TagInfo}).
 				Menu(func(mn *ui.Menu) { a.branchPopupMenu(mn) })
-			if m.Snap.Detached {
-				action.Button(c, "建分支", action.ButtonProps{Variant: action.Text, Size: theme.Small}).
-					OnClick(func() {
-						a.newBranchFrom = ""
-						a.branchDialogOpen = true
-					})
+			if m.Snap.Rev != "" {
+				display.Tag(c, m.Snap.Rev, display.TagProps{Variant: display.TagBorderless, Color: display.TagGray})
 			}
-			if ab := aheadBehind(m.Snap); ab != "" {
-				display.Tag(c, ab, display.TagProps{Variant: display.TagBorderless})
+			if gs := m.Snap.Git; gs != nil {
+				if gs.Detached {
+					action.Button(c, "建分支", action.ButtonProps{Variant: action.Text, Size: theme.Small}).
+						OnClick(func() {
+							a.newBranchFrom = ""
+							a.branchDialogOpen = true
+						})
+				}
+				if ab := components.AheadBehind(gs.Ahead, gs.Behind); ab != "" {
+					display.Tag(c, ab, display.TagProps{Variant: display.TagBorderless})
+				}
 			}
-			if m.Snap.InProgress != "" {
-				display.Tag(c, "进行中："+m.Snap.InProgress, display.TagProps{Variant: display.TagFilled, Color: display.TagWarning})
+			if m.Snap.Detail != "" {
+				display.Tag(c, m.Snap.Detail, display.TagProps{Variant: display.TagBorderless, Color: display.TagWarning})
+			}
+			if gs := m.Snap.Git; gs != nil && gs.InProgress != "" {
+				display.Tag(c, "进行中："+gs.InProgress, display.TagProps{Variant: display.TagFilled, Color: display.TagWarning})
 				// 全部冲突解决后可继续；任何时候可中止。
-				prog := m.Snap.Progress()
-				if !prog.CanContinue && len(m.Snap.Conflicts()) > 0 {
+				prog := gs.Progress()
+				if !prog.CanContinue && len(gs.Conflicts()) > 0 {
 					action.Button(c, "解决冲突…", action.ButtonProps{Variant: action.Default, Size: theme.Small}).
 						OnClick(func() {
 							a.conflicts.openFor(m.RepoPath, a.updater())
@@ -757,24 +887,37 @@ func (a *app) headerView(c *ui.Context, t *ui.Theme) {
 		}
 		// Flexible spacer pushes the remote actions to the far edge.
 		ui.Text(c, "").Grow(1)
-		action.Button(c, "获取", action.ButtonProps{Variant: action.Text, Size: theme.Small}).
-			Disabled(m.busy).OnClick(func() { a.commit.fetch(appCTX, a.updater()) })
-		action.Button(c, "拉取", action.ButtonProps{Variant: action.Text, Size: theme.Small}).
-			Disabled(m.busy).OnClick(func() { a.commit.openPullDialog(a.updater()) })
-		action.Button(c, "推送", action.ButtonProps{Variant: action.Text, Size: theme.Small}).
-			Disabled(m.busy).OnClick(func() { a.commit.openPushDialog(a.updater(), false) })
-		action.Button(c, "应用补丁…", action.ButtonProps{Variant: action.Text, Size: theme.Small}).
-			Disabled(m.busy).OnClick(a.openApplyPatch)
-		action.Button(c, "Reflog", action.ButtonProps{Variant: action.Text, Size: theme.Small}).
-			Disabled(m.busy).OnClick(func() {
-			a.reflog.openFor(m.RepoPath, a.updater())
-		})
-		action.Button(c, "二分", action.ButtonProps{Variant: action.Text, Size: theme.Small}).
-			Disabled(m.busy).OnClick(func() {
-			m.bisectOpen = true
-			m.bisectErr = ""
-			m.loadBisectStatus(a.updater())
-		})
+		if m.isSVN() {
+			// svn: commit IS the push — the only remote op is update.
+			action.Button(c, "更新", action.ButtonProps{Variant: action.Text, Size: theme.Small}).
+				Disabled(m.busy).OnClick(func() { a.commit.svnUpdate(appCTX, a.updater()) })
+			// svn has no .gitignore file to open — the ignore rules
+			// live in per-directory props, so the app lists them.
+			action.Button(c, "忽略…", action.ButtonProps{Variant: action.Text, Size: theme.Small}).
+				Disabled(m.busy).OnClick(func() {
+				m.ignoreOpen = true
+				m.svnLoadIgnores(appCTX, a.updater())
+			})
+		} else {
+			action.Button(c, "获取", action.ButtonProps{Variant: action.Text, Size: theme.Small}).
+				Disabled(m.busy).OnClick(func() { a.commit.fetch(appCTX, a.updater()) })
+			action.Button(c, "拉取", action.ButtonProps{Variant: action.Text, Size: theme.Small}).
+				Disabled(m.busy).OnClick(func() { a.commit.openPullDialog(a.updater()) })
+			action.Button(c, "推送", action.ButtonProps{Variant: action.Text, Size: theme.Small}).
+				Disabled(m.busy).OnClick(func() { a.commit.openPushDialog(a.updater(), false) })
+			action.Button(c, "应用补丁…", action.ButtonProps{Variant: action.Text, Size: theme.Small}).
+				Disabled(m.busy).OnClick(a.openApplyPatch)
+			action.Button(c, "Reflog", action.ButtonProps{Variant: action.Text, Size: theme.Small}).
+				Disabled(m.busy).OnClick(func() {
+				a.reflog.openFor(m.RepoPath, a.updater())
+			})
+			action.Button(c, "二分", action.ButtonProps{Variant: action.Text, Size: theme.Small}).
+				Disabled(m.busy).OnClick(func() {
+				m.bisectOpen = true
+				m.bisectErr = ""
+				m.loadBisectStatus(a.updater())
+			})
+		}
 		action.Button(c, "刷新", action.ButtonProps{Variant: action.Text, Size: theme.Small}).
 			Disabled(m.busy).OnClick(func() {
 			a.commit.refresh(appCTX, a.updater())
@@ -808,7 +951,7 @@ func (a *app) continueOp(kind string) {
 				m.syncOK = "已继续"
 			}
 			if snap != nil {
-				m.Snap = snap
+				m.Snap = vcs.WrapGit(snap)
 				m.reconcileLists()
 				m.pruneChecked()
 				m.ensureSelectedFile()
@@ -843,7 +986,7 @@ func (a *app) abortOp(kind string) {
 				m.syncOK = "已中止"
 			}
 			if snap != nil {
-				m.Snap = snap
+				m.Snap = vcs.WrapGit(snap)
 				m.reconcileLists()
 				m.pruneChecked()
 				m.ensureSelectedFile()
@@ -859,7 +1002,14 @@ func (a *app) filesPane(c *ui.Context, t *ui.Theme) {
 	ui.Column(c).Fill().Gap(0).Background(tk.BgContainer).Children(func() {
 		ui.Row(c).Padding(8, 12).Gap(8).AlignItems(ui.Center).Children(func() {
 			prevMode := m.mode
-			action.Segmented(c, &m.mode, []string{"列表", "更改"}, action.SegmentedProps{Size: theme.Small})
+			if m.isSVN() {
+				// svn has no staging index — the 更改 (staging) view is a
+				// git concept; lock the picker on 列表.
+				m.mode = 0
+				action.Segmented(c, &m.mode, []string{"列表"}, action.SegmentedProps{Size: theme.Small})
+			} else {
+				action.Segmented(c, &m.mode, []string{"列表", "更改"}, action.SegmentedProps{Size: theme.Small})
+			}
 			if m.mode != prevMode {
 				// The two modes give a check a different meaning
 				// (changelist = commit scope; staging = batch pick), so
@@ -892,23 +1042,20 @@ func (a *app) filesPane(c *ui.Context, t *ui.Theme) {
 				Variant: feedback.Plain,
 			}).Padding(8, 12)
 		}
-		layout.ScrollArea(c, layout.ScrollAreaProps{State: &a.fileScroll}, func() {
-			ui.Column(c).FillWidth().Children(func() {
-				if a.commit.filter != "" {
-					// Filter mode: flat result list, no group chrome.
-					for _, row := range a.visibleRows() {
-						a.fileRowView(c, t, row)
-					}
-					return
-				}
-				if m.mode == 1 {
-					a.stagingGroups(c, t)
-					return
-				}
-				for _, g := range m.groups() {
-					a.listGroupView(c, t, g)
-				}
-			})
+		rows := a.filePaneRows()
+		a.fileList.Key = func(i int) any { return rows[i].key }
+		ui.List(c, &a.fileList, len(rows), func(i int) {
+			row := rows[i]
+			switch row.kind {
+			case paneListHeader:
+				a.listGroupView(c, t, row.group)
+			case paneStagingHeader:
+				a.stagingSection(c, t, row.title, row.files, row.groupKey)
+			case paneStagingFile:
+				a.stagingRowView(c, t, row.file.change)
+			default:
+				a.fileRowView(c, t, row.file)
+			}
 		}).Grow(1)
 	})
 }
@@ -932,29 +1079,79 @@ func (a *app) createListFromInput() {
 	m.newListOpen = false
 }
 
-// stagingGroups renders the IDEA "Local Changes" split: 更改 (tracked
-// changes, staged or not) / 未进行版本管理的文件 (untracked). AM files
-// appear once under 更改 — they are tracked, so their worktree side
-// stays a tracked change.
-func (a *app) stagingGroups(c *ui.Context, t *ui.Theme) {
-	m := &a.commit
-	if m.Snap == nil {
-		return
-	}
-	var tracked, untracked []git.FileChange
-	for _, f := range m.Snap.Files {
-		if f.Kind == git.KindUntracked {
-			untracked = append(untracked, f)
-		} else {
-			tracked = append(tracked, f)
-		}
-	}
-	a.stagingSection(c, t, "更改", tracked, "changes")
-	a.stagingSection(c, t, "未进行版本管理的文件", untracked, "unversioned")
+type filePaneRowKind uint8
+
+const (
+	paneListFile filePaneRowKind = iota
+	paneListHeader
+	paneStagingHeader
+	paneStagingFile
+)
+
+// filePaneRow keeps headers and files in one virtual list. Only visible
+// rows are built, but header actions retain the complete group contents.
+type filePaneRow struct {
+	key      string
+	kind     filePaneRowKind
+	file     fileRow
+	group    listGroup
+	title    string
+	groupKey string
+	files    []git.FileChange
 }
 
-// stagingSection draws one of the two groups with its header and rows.
-// groupKey is a stable id for collapse + group-checkbox state.
+func (a *app) filePaneRows() []filePaneRow {
+	m := &a.commit
+	if m.collapsed == nil {
+		m.collapsed = make(map[string]bool)
+	}
+	rows := make([]filePaneRow, 0)
+	if m.filter != "" {
+		for _, row := range a.visibleRows() {
+			rows = append(rows, filePaneRow{key: "file:" + row.change.Path, file: row})
+		}
+		return rows
+	}
+	if m.mode == 1 {
+		if m.Snap == nil {
+			return rows
+		}
+		var tracked, untracked []git.FileChange
+		for _, f := range m.Snap.Files {
+			if f.Kind == git.KindUntracked {
+				untracked = append(untracked, f)
+			} else {
+				tracked = append(tracked, f)
+			}
+		}
+		appendSection := func(title, key string, files []git.FileChange) {
+			rows = append(rows, filePaneRow{key: "staging-header:" + key, kind: paneStagingHeader, title: title, groupKey: key, files: files})
+			if !m.collapsed["stg-"+key] {
+				for _, f := range files {
+					rows = append(rows, filePaneRow{key: "staging-file:" + f.Path, kind: paneStagingFile, file: fileRow{change: f}})
+				}
+			}
+		}
+		appendSection("更改", "changes", tracked)
+		appendSection("未进行版本管理的文件", "unversioned", untracked)
+		return rows
+	}
+	for _, group := range m.groups() {
+		if len(group.Rows) == 0 && group.Name != store.DefaultName {
+			continue
+		}
+		rows = append(rows, filePaneRow{key: "list-header:" + group.Name, kind: paneListHeader, group: group})
+		if !m.collapsed[group.Name] {
+			for _, row := range group.Rows {
+				rows = append(rows, filePaneRow{key: "file:" + row.change.Path, file: row})
+			}
+		}
+	}
+	return rows
+}
+
+// stagingSection draws a group header. groupKey is a stable id for
+// collapse + group-checkbox state.
 func (a *app) stagingSection(c *ui.Context, t *ui.Theme, title string, files []git.FileChange, groupKey string) {
 	m := &a.commit
 	if m.collapsed == nil {
@@ -983,12 +1180,6 @@ func (a *app) stagingSection(c *ui.Context, t *ui.Theme, title string, files []g
 		ui.Text(c, title).Bold().FontSize(12).SingleLine().Grow(1)
 		ui.Text(c, fmt.Sprintf("%d", len(files))).FontSize(11).TextColor(t.TextMuted)
 	})
-	if m.collapsed[key] {
-		return
-	}
-	for _, f := range files {
-		a.stagingRowView(c, t, f)
-	}
 }
 
 // stagingRowView: checkbox (include in commit) + click-to-diff. An AM
@@ -999,20 +1190,20 @@ func (a *app) stagingRowView(c *ui.Context, t *ui.Theme, ch git.FileChange) {
 	path := ch.Path
 	cb := m.checks.checkboxFor(path)
 	rowEl := ui.Row(c).Key("sfile-"+path).FillWidth().Padding(6, 12).Gap(10).
-		Background(rowBg(t, m.selectedFile == path)).
+		Background(components.RowBg(t, m.selectedFile == path)).
 		AlignItems(ui.Center)
 	rowEl.Children(func() {
 		choice.Checkbox(c, cb, "", choice.CheckboxProps{Size: 14}).Disabled(ch.Conflict())
-		display.Tag(c, statusGlyph(ch.Kind), display.TagProps{
+		display.Tag(c, components.StatusGlyph(ch.Kind), display.TagProps{
 			Variant: display.TagBorderless,
-			Color:   statusTagColor(ch.Kind),
+			Color:   components.StatusTagColor(ch.Kind),
 		})
 		label := path
 		if ch.OrigPath != "" {
 			label = ch.OrigPath + " → " + path
 		}
 		ui.Text(c, label).SingleLine().
-			TextColor(rowLabelColor(t, m.selectedFile == path)).
+			TextColor(components.RowLabelColor(t, m.selectedFile == path)).
 			OnClick(func() {
 				if ch.Conflict() {
 					a.conflict.openFor(m.RepoPath, path, a.updater())
@@ -1032,6 +1223,7 @@ func (a *app) stagingRowView(c *ui.Context, t *ui.Theme, ch git.FileChange) {
 		}
 	})
 	rowEl.ContextMenu(func(mn *ui.Menu) {
+		isSVN := m.isSVN()
 		untracked := ch.Kind == git.KindUntracked
 		if ch.Conflict() {
 			if mn.Item("解决冲突…").Chosen() {
@@ -1039,7 +1231,27 @@ func (a *app) stagingRowView(c *ui.Context, t *ui.Theme, ch git.FileChange) {
 			}
 			mn.Separator()
 		}
-		if untracked {
+		if isSVN {
+			// svn: 无 staging/stash/gitignore —— add/revert/ignore/delete。
+			if untracked {
+				if mn.Item("加入版本控制（svn add）").Chosen() {
+					m.svnAdd(appCTX, a.updater(), path)
+				}
+				if mn.Item("加入忽略（svn:ignore）").Chosen() {
+					m.svnIgnoreAdd(appCTX, a.updater(), path)
+				}
+				if mn.Item("删除…").Chosen() {
+					a.askDelete(path)
+				}
+			} else {
+				if mn.Item("回滚（svn revert）…").Chosen() {
+					a.askRevert([]string{path}, false)
+				}
+				if mn.Item("删除并移出版本控制…").Chosen() {
+					a.askDelete(path)
+				}
+			}
+		} else if untracked {
 			if mn.Item("搁置此文件到 stash").Chosen() {
 				m.shelvePaths(appCTX, a.updater(), []string{path}, true)
 			}
@@ -1067,12 +1279,14 @@ func (a *app) stagingRowView(c *ui.Context, t *ui.Theme, ch git.FileChange) {
 			}
 		}
 		mn.Separator()
-		if mn.Item("查看历史").Chosen() {
-			a.fileHist.openFor(m.RepoPath, path, a.updater())
-		}
-		if mn.Item("查看溯源（Blame）").Chosen() {
-			a.fileHist.mode = 1
-			a.fileHist.openFor(m.RepoPath, path, a.updater())
+		if !(isSVN && untracked) {
+			if mn.Item("查看历史").Chosen() {
+				a.fileHist.openFor(m.RepoPath, path, a.updater())
+			}
+			if mn.Item("查看溯源（Blame）").Chosen() {
+				a.fileHist.mode = 1
+				a.fileHist.openFor(m.RepoPath, path, a.updater())
+			}
 		}
 		mn.Separator()
 		if mn.Item("在 Finder 中显示").Chosen() {
@@ -1084,7 +1298,7 @@ func (a *app) stagingRowView(c *ui.Context, t *ui.Theme, ch git.FileChange) {
 	})
 }
 
-// listGroupView draws one collapsible changelist header + its files.
+// listGroupView draws one collapsible changelist header.
 func (a *app) listGroupView(c *ui.Context, t *ui.Theme, g listGroup) {
 	m := &a.commit
 	if m.collapsed == nil {
@@ -1094,6 +1308,7 @@ func (a *app) listGroupView(c *ui.Context, t *ui.Theme, g listGroup) {
 		return // empty named lists hide (IDEA collapses them away)
 	}
 	name := g.Name
+	readonly := name == "已忽略" // svn ignored 组：只展示，无勾选/提交
 	// Header: fold arrow + name + count + active marker + group menu.
 	hdr := ui.Row(c).Key("lg-"+name).FillWidth().Padding(5, 12).Gap(8).AlignItems(ui.Center)
 	hdr.Children(func() {
@@ -1106,13 +1321,15 @@ func (a *app) listGroupView(c *ui.Context, t *ui.Theme, g listGroup) {
 		// Group checkbox ticks every file in the list. Bind a stable
 		// *bool so the click writes somewhere we can read back; the
 		// post-frame toggle uses the freshly-written value.
-		bind := m.groupCheckBind(name)
-		m.syncGroupCheck(name, g.CheckedN, len(g.Rows)) // keep in step pre-click
-		partial := g.CheckedN > 0 && g.CheckedN < len(g.Rows)
-		choice.Checkbox(c, bind, "", choice.CheckboxProps{Size: 12, Indeterminate: partial}).
-			OnClick(func() {
-				m.checkGroup(name, *bind) // *bind is now the new state
-			})
+		if !readonly {
+			bind := m.groupCheckBind(name)
+			m.syncGroupCheck(name, g.CheckedN, len(g.Rows)) // keep in step pre-click
+			partial := g.CheckedN > 0 && g.CheckedN < len(g.Rows)
+			choice.Checkbox(c, bind, "", choice.CheckboxProps{Size: 12, Indeterminate: partial}).
+				OnClick(func() {
+					m.checkGroup(name, *bind) // *bind is now the new state
+				})
+		}
 		label := name
 		if g.Active {
 			label += "（活动）"
@@ -1120,37 +1337,33 @@ func (a *app) listGroupView(c *ui.Context, t *ui.Theme, g listGroup) {
 		ui.Text(c, label).Bold().FontSize(12).SingleLine().Grow(1)
 		ui.Text(c, fmt.Sprintf("%d", len(g.Rows))).FontSize(11).TextColor(t.TextMuted)
 	})
-	hdr.ContextMenu(func(mn *ui.Menu) {
-		// IDEA: "Commit this changelist" — tick only its files.
-		if len(g.Rows) > 0 {
-			if mn.Item("仅提交此变更列表").Chosen() {
-				m.checkNone()
-				m.checkGroup(name, true)
+	if !readonly {
+		hdr.ContextMenu(func(mn *ui.Menu) {
+			// IDEA: "Commit this changelist" — tick only its files.
+			if len(g.Rows) > 0 {
+				if mn.Item("仅提交此变更列表").Chosen() {
+					m.checkNone()
+					m.checkGroup(name, true)
+				}
 			}
-		}
-		if !g.Active && name != store.DefaultName {
-			if mn.Item("设为活动").Chosen() {
-				m.setActiveList(name)
+			if !g.Active && name != store.DefaultName {
+				if mn.Item("设为活动").Chosen() {
+					m.setActiveList(name)
+				}
 			}
-		}
-		if name != store.DefaultName {
-			mn.Separator()
-			if mn.Item("删除列表").Chosen() {
-				m.deleteList(name)
+			if name != store.DefaultName {
+				mn.Separator()
+				if mn.Item("删除列表").Chosen() {
+					m.deleteList(name)
+				}
 			}
-		}
-	})
-	if m.collapsed[name] {
-		return
-	}
-	for _, row := range g.Rows {
-		a.fileRowView(c, t, row)
+		})
 	}
 }
 
 // visibleRows is the displayed subset (filter applied).
 func (a *app) visibleRows() []fileRow {
-	rows := rowsFor(a.commit.Snap)
+	rows := a.commit.fileRows()
 	if a.commit.filter == "" {
 		return rows
 	}
@@ -1170,15 +1383,21 @@ func (a *app) fileRowView(c *ui.Context, t *ui.Theme, row fileRow) {
 	m := &a.commit
 	ch := row.change
 	path := ch.Path
-	cb := m.checks.checkboxFor(path)
+	ignored := ch.Kind == vcs.KindIgnored
 	rowEl := ui.Row(c).Key("file-"+path).FillWidth().Padding(6, 12).Gap(10).
-		Background(rowBg(t, a.commit.selectedFile == path)).
+		Background(components.RowBg(t, a.commit.selectedFile == path)).
 		AlignItems(ui.Center)
 	rowEl.Children(func() {
-		choice.Checkbox(c, cb, "", choice.CheckboxProps{Size: 14}).Disabled(ch.Conflict())
-		display.Tag(c, statusGlyph(ch.Kind), display.TagProps{
+		if ignored {
+			// 已忽略行不占提交名额 —— 留空让标签对齐。
+			ui.Text(c, "").Width(14)
+		} else {
+			cb := m.checks.checkboxFor(path)
+			choice.Checkbox(c, cb, "", choice.CheckboxProps{Size: 14}).Disabled(ch.Conflict())
+		}
+		display.Tag(c, components.StatusGlyph(ch.Kind), display.TagProps{
 			Variant: display.TagBorderless,
-			Color:   statusTagColor(ch.Kind),
+			Color:   components.StatusTagColor(ch.Kind),
 		})
 		label := path
 		if ch.OrigPath != "" {
@@ -1187,8 +1406,11 @@ func (a *app) fileRowView(c *ui.Context, t *ui.Theme, row fileRow) {
 		// The path text is the click target; conflicts open the resolver
 		// instead of a diff that can't render three sides.
 		ui.Text(c, label).SingleLine().
-			TextColor(rowLabelColor(t, a.commit.selectedFile == path)).
+			TextColor(components.RowLabelColor(t, a.commit.selectedFile == path)).
 			OnClick(func() {
+				if ignored {
+					return // no diff for ignored paths — nothing tracked
+				}
 				if ch.Conflict() {
 					a.conflict.openFor(m.RepoPath, path, a.updater())
 					return
@@ -1199,7 +1421,22 @@ func (a *app) fileRowView(c *ui.Context, t *ui.Theme, row fileRow) {
 	// Right-click: move this file to another changelist + history +
 	// file ops (revert / gitignore / shelve / delete).
 	rowEl.ContextMenu(func(mn *ui.Menu) {
-		untracked := ch.Kind == git.KindUntracked
+		isSVN := m.isSVN()
+		untracked := ch.Kind == vcs.KindUntracked
+		if ignored {
+			// 取消忽略：删掉匹配该文件的 svn:ignore 条目。
+			if mn.Item("取消忽略").Chosen() {
+				m.svnUnignorePath(appCTX, a.updater(), path)
+			}
+			mn.Separator()
+			if mn.Item("在 Finder 中显示").Chosen() {
+				a.revealPath(path)
+			}
+			if mn.Item("复制路径").Chosen() {
+				a.copyPath(c, path)
+			}
+			return
+		}
 		if ch.Conflict() {
 			if mn.Item("解决冲突…").Chosen() {
 				a.conflict.openFor(m.RepoPath, path, a.updater())
@@ -1207,7 +1444,27 @@ func (a *app) fileRowView(c *ui.Context, t *ui.Theme, row fileRow) {
 			mn.Separator()
 		}
 		// File ops.
-		if untracked {
+		if isSVN {
+			// svn: no staging/stash/gitignore — add, revert, delete only.
+			if untracked {
+				if mn.Item("加入版本控制（svn add）").Chosen() {
+					m.svnAdd(appCTX, a.updater(), path)
+				}
+				if mn.Item("加入忽略（svn:ignore）").Chosen() {
+					m.svnIgnoreAdd(appCTX, a.updater(), path)
+				}
+				if mn.Item("删除…").Chosen() {
+					a.askDelete(path)
+				}
+			} else {
+				if mn.Item("回滚（svn revert）…").Chosen() {
+					a.askRevert([]string{path}, false)
+				}
+				if mn.Item("删除并移出版本控制…").Chosen() {
+					a.askDelete(path)
+				}
+			}
+		} else if untracked {
 			if mn.Item("搁置此文件到 stash").Chosen() {
 				m.shelvePaths(appCTX, a.updater(), []string{path}, true)
 			}
@@ -1238,12 +1495,16 @@ func (a *app) fileRowView(c *ui.Context, t *ui.Theme, row fileRow) {
 			}
 		}
 		mn.Separator()
-		if mn.Item("查看历史").Chosen() {
-			a.fileHist.openFor(m.RepoPath, path, a.updater())
-		}
-		if mn.Item("查看溯源（Blame）").Chosen() {
-			a.fileHist.mode = 1
-			a.fileHist.openFor(m.RepoPath, path, a.updater())
+		// 历史/溯源只在版本控制下有内容 —— svn 未版本化路径点开只
+		// 是 E155010 报错，不如不显示。
+		if !(isSVN && untracked) {
+			if mn.Item("查看历史").Chosen() {
+				a.fileHist.openFor(m.RepoPath, path, a.updater())
+			}
+			if mn.Item("查看溯源（Blame）").Chosen() {
+				a.fileHist.mode = 1
+				a.fileHist.openFor(m.RepoPath, path, a.updater())
+			}
 		}
 		mn.Separator()
 		if mn.Item("在 Finder 中显示").Chosen() {
@@ -1252,12 +1513,12 @@ func (a *app) fileRowView(c *ui.Context, t *ui.Theme, row fileRow) {
 		if mn.Item("复制路径").Chosen() {
 			a.copyPath(c, path)
 		}
-		if mn.Item("创建补丁…").Chosen() {
+		if !isSVN && mn.Item("创建补丁…").Chosen() {
 			a.exportWorktreePatch(path)
 		}
 		// IDEA's "move to another changelist" only applies to tracked
 		// changes — untracked files aren't changelist members.
-		if m.lists != nil && !untracked {
+		if !isSVN && m.lists != nil && !untracked {
 			mn.Separator()
 			for _, l := range m.lists.All() {
 				if l.Name == row.list {
@@ -1313,8 +1574,11 @@ func (a *app) revertDialog(c *ui.Context, t *ui.Theme) {
 		paths := append([]string(nil), ask.Paths...)
 		del := ask.Delete
 		staged := ask.Staged
+		run := ask.Run
 		m.pendingRevert = revertAsk{}
 		switch {
+		case run != nil:
+			run()
 		case del != "":
 			m.deleteUntracked(appCTX, a.updater(), del)
 		case staged:
@@ -1340,6 +1604,12 @@ func (a *app) askRevert(paths []string, staged bool) {
 		Staged: staged,
 		Paths:  paths,
 	}
+}
+
+// askRun opens a confirm dialog whose OK runs fn — for destructive ops
+// that aren't file-scoped reverts (hard reset, stash drop, …).
+func (a *app) askRun(title, body string, fn func()) {
+	a.commit.pendingRevert = revertAsk{Open: true, Title: title, Body: body, Run: fn}
 }
 
 // askDelete opens the delete-confirmation for one untracked file.
@@ -1369,2789 +1639,15 @@ func (a *app) copyPath(c *ui.Context, path string) {
 	c.WriteClipboard(path)
 }
 
-// rowBg: selected rows get the selection tint.
-func rowBg(t *ui.Theme, sel bool) ui.Color {
-	if sel {
-		return t.Selection
-	}
-	return ui.Transparent
-}
-
-func rowLabelColor(t *ui.Theme, sel bool) ui.Color {
-	if sel {
-		return t.Accent
-	}
-	return t.Text
-}
-
 // selectRow records the pick and schedules a fresh diff load. Picking
-// the already-loaded file is a no-op so rapid clicks don't thrash the
-// diff worker or rebuild the view.
+// the already-loaded/loading file is a no-op so rapid clicks don't
+// thrash the diff worker or rebuild the view.
 func (a *app) selectRow(ch git.FileChange) {
-	if a.commit.selectedFile == ch.Path && !a.commit.diffLoading && a.commit.diff != nil {
-		return
+	if a.commit.selectedFile == ch.Path {
+		return // same row: loading or loaded, the pick didn't change
 	}
 	a.diffState = nil // rebuild DiffView state for the new file
 	a.commit.selectFile(ch)
-}
-
-// --- 历史（History）页 -------------------------------------------------
-
-// historyView: commit list | (files | diff) — IDEA's Git Log layout.
-func (a *app) historyView(c *ui.Context, t *ui.Theme) {
-	m := &a.history
-	tk := theme.TokensOf(c)
-	// Kick the load once the repo is known; idempotent while loaded.
-	m.ensureLoaded(a.commit.RepoPath, a.updater())
-
-	ui.Split(c, &a.histListW,
-		func() { a.commitListPane(c, t) },
-		func() {
-			ui.Split(c, &a.histFilesW,
-				func() { a.commitFilesPane(c, t) },
-				func() {
-					a.renderDiffPane(c, t, diffSource{
-						selection: m.selectedFile,
-						loading:   m.diffLoading,
-						err:       m.diffErr,
-						diff:      m.diff,
-						emptyText: "选择提交和文件查看变更。",
-					})
-				},
-			).Fill()
-		},
-	).Fill().Grow(1)
-	_ = tk
-}
-
-// commitListPane: the scrollable log (refs + subject + author + time).
-func (a *app) commitListPane(c *ui.Context, t *ui.Theme) {
-	m := &a.history
-	tk := theme.TokensOf(c)
-	ui.Column(c).Fill().Gap(0).Background(tk.BgContainer).Children(func() {
-		ui.Row(c).Padding(8, 12).Gap(8).AlignItems(ui.Center).Children(func() {
-			ui.Text(c, "提交").Bold()
-			// Spin while log/files/diff is in flight so refresh/filter shows
-			// something is happening (IDEA also spins the log toolbar).
-			busy := m.loading || m.filesLoading || m.diffLoading
-			feedback.Spin(c, feedback.SpinProps{Size: theme.Small, Spinning: &busy}, nil)
-			ui.Text(c, "").Grow(1)
-			action.Button(c, "跳转…", action.ButtonProps{Variant: action.Text, Size: theme.Small}).
-				OnClick(func() {
-					m.gotoOpen = true
-					m.gotoInput, m.gotoErr = "", ""
-				})
-			action.Button(c, "刷新", action.ButtonProps{Variant: action.Text, Size: theme.Small}).
-				Disabled(m.loading).OnClick(func() {
-				m.lastLoadedRepo = ""
-				m.ensureLoaded(a.commit.RepoPath, a.updater())
-			})
-		})
-		// IDEA's filter bar: branch / author / message / path.
-		ui.Row(c).Padding(4, 12).Gap(6).AlignItems(ui.Center).Children(func() {
-			field.Input(c, &m.filterBranch, field.InputProps{
-				Placeholder: "分支…", Size: theme.Small,
-			}).Width(80).OnSubmit(func() { m.reloadFiltered(a.commit.RepoPath, a.updater()) })
-			field.Input(c, &m.filterAuthor, field.InputProps{
-				Placeholder: "作者…", Size: theme.Small,
-			}).Width(80).OnSubmit(func() { m.reloadFiltered(a.commit.RepoPath, a.updater()) })
-			field.Input(c, &m.filterGrep, field.InputProps{
-				Placeholder: "消息…", Size: theme.Small,
-			}).Grow(1).OnSubmit(func() { m.reloadFiltered(a.commit.RepoPath, a.updater()) })
-			field.Input(c, &m.filterPath, field.InputProps{
-				Placeholder: "路径…", Size: theme.Small,
-			}).Width(80).OnSubmit(func() { m.reloadFiltered(a.commit.RepoPath, a.updater()) })
-			action.Button(c, "应用", action.ButtonProps{Variant: action.Text, Size: theme.Small}).
-				OnClick(func() { m.reloadFiltered(a.commit.RepoPath, a.updater()) })
-			if m.filterActive {
-				action.Button(c, "×", action.ButtonProps{Variant: action.Text, Size: theme.Small}).
-					OnClick(func() {
-						m.filterBranch, m.filterAuthor, m.filterGrep, m.filterPath = "", "", "", ""
-						m.filterAll = false
-						m.reloadFiltered(a.commit.RepoPath, a.updater())
-					})
-			}
-		})
-		if m.filterActive {
-			ui.Row(c).Padding(2, 12).Children(func() {
-				display.Tag(c, "已启用过滤", display.TagProps{Variant: display.TagBorderless, Color: display.TagInfo})
-			})
-		}
-		switch {
-		case m.loading && len(m.commits) == 0:
-			a.placeholder(c, t, "正在加载历史…")
-		case m.err != "":
-			ui.Column(c).Padding(8, 12).Children(func() {
-				feedback.Alert(c, m.err, feedback.AlertProps{Type: feedback.Error, Variant: feedback.Soft})
-			})
-		case len(m.commits) == 0:
-			display.Empty(c, display.EmptyProps{
-				Title:       "暂无提交",
-				Description: "此分支还没有提交记录",
-			}).Padding(24)
-		default:
-			// ui.List is mygo's virtual list: it builds only the rows in
-			// view (plus a few), so 5000-commit histories cost the same
-			// as 50. Key = OID keeps selection/scroll stable as pages
-			// append below.
-			m.listState.Key = func(row int) any {
-				if row < len(m.commits) {
-					return m.commits[row].OID
-				}
-				return "loadmore"
-			}
-			n := len(m.commits)
-			if m.hasMore {
-				n++ // trailing "load more" row
-			}
-			ui.List(c, &m.listState, n, func(i int) {
-				if i < len(m.commits) {
-					var gl *git.GraphLine
-					if i < len(m.graph) {
-						gl = &m.graph[i]
-					}
-					a.commitRowView(c, t, &m.commits[i], gl)
-					return
-				}
-				ui.Row(c).FillWidth().Padding(6, 14).Children(func() {
-					if m.loading {
-						ui.Text(c, "正在加载…").FontSize(11).TextColor(t.TextMuted)
-					} else {
-						action.Button(c, "加载更多提交…", action.ButtonProps{Variant: action.Text, Size: theme.Small}).
-							OnClick(func() { m.loadMore(a.commit.RepoPath, a.updater()) })
-					}
-				})
-			}).Grow(1)
-		}
-	})
-}
-
-// graphColors picks a lane's color (cycles; IDEA uses distinct colors).
-var graphColors = []ui.Color{
-	ui.RGB(0x5b, 0x8d, 0xef), ui.RGB(0x53, 0xc1, 0x8d), ui.RGB(0xe0, 0x9f, 0x3e),
-	ui.RGB(0xcf, 0x67, 0xcc), ui.RGB(0xef, 0x6b, 0x6b), ui.RGB(0x3f, 0xa6, 0xc3),
-}
-
-// graphCell draws the 24-DIP lane column for one row: vertical lines,
-// the commit node, and any merge/fork connectors.
-func graphCell(c *ui.Context, gl *git.GraphLine) ui.Element {
-	return ui.Row(c).Width(24).Fill().Draw(func(p *ui.Painter, r ui.Rect) {
-		if gl == nil {
-			return
-		}
-		laneX := func(l int) float32 { return r.X + 6 + float32(l)*8 }
-		cy := r.Y + r.H/2
-		// Vertical pass-throughs.
-		for l, v := range gl.Lanes {
-			if v == 0 || l == gl.Lane {
-				continue
-			}
-			col := graphColors[l%len(graphColors)]
-			path := &ui.Path{}
-			path.MoveTo(laneX(l), r.Y).LineTo(laneX(l), r.Y+r.H)
-			p.StrokePath(path, 1.5, col)
-		}
-		// Edge connectors to parents on other lanes (merge/fork).
-		for _, e := range gl.Edges {
-			x0, x1 := laneX(e[0]), laneX(e[1])
-			col := graphColors[e[1]%len(graphColors)]
-			path := &ui.Path{}
-			path.MoveTo(x0, cy).
-				CubeTo(x0, cy+8, x1, cy-8, x1, r.Y+r.H) // down-right/left curve
-			p.StrokePath(path, 1.5, col)
-		}
-		// Commit node.
-		col := graphColors[0]
-		if gl.ColorIdx >= 0 {
-			col = graphColors[gl.ColorIdx%len(graphColors)]
-		}
-		node := &ui.Path{}
-		node.Circle(laneX(gl.Lane), cy, 3.5)
-		p.FillPath(node, col)
-		// Line into/out of the node (the lane's own vertical).
-		path := &ui.Path{}
-		path.MoveTo(laneX(gl.Lane), r.Y).LineTo(laneX(gl.Lane), cy-3.5)
-		p.StrokePath(path, 1.5, col)
-		path2 := &ui.Path{}
-		path2.MoveTo(laneX(gl.Lane), cy+3.5).LineTo(laneX(gl.Lane), r.Y+r.H)
-		p.StrokePath(path2, 1.5, col)
-	})
-}
-
-// commitRowView: one history entry — graph + subject + refs + author + time.
-func (a *app) commitRowView(c *ui.Context, t *ui.Theme, cm *git.Commit, gl *git.GraphLine) {
-	sel := a.history.selectedID == cm.OID
-	repoPath := a.commit.RepoPath
-	oid := cm.OID
-	rowEl := ui.Row(c).Key("cmt-"+oid).FillWidth().Padding(7, 14).Gap(10).AlignItems(ui.Center).
-		Background(rowBg(t, sel))
-	rowEl.OnClick(func() {
-		a.diffState = nil
-		a.history.selectCommit(repoPath, oid, a.updater())
-	})
-	rowEl.ContextMenu(func(mn *ui.Menu) {
-		isHead := len(a.history.commits) > 0 && a.history.commits[0].OID == oid
-		if mn.Item("复制修订号").Chosen() {
-			c.WriteClipboard(oid)
-			a.notify("success", "已复制 "+cm.ShortOID)
-		}
-		mn.Separator()
-		if mn.Item("Cherry-pick 到当前分支").Chosen() {
-			a.commit.cherryPick(appCTX, a.updater(), oid)
-		}
-		if isHead {
-			if mn.Item("撤消提交…").Chosen() {
-				a.commit.undoHeadCommit(appCTX, a.updater())
-			}
-		}
-		if mn.Item("从此提交交互式变基…").Chosen() {
-			a.commit.openRebaseDialog(a.updater(), oid)
-		}
-		if isHead {
-			if mn.Item("编辑提交消息…").Chosen() {
-				a.amendOID = oid
-				a.amendInput = cm.Subject
-				a.amendOpen = true
-			}
-		} else {
-			if mn.Item("编辑提交消息…").Chosen() {
-				a.commit.openRebaseDialogPreset(a.updater(), oid+"~1", oid, git.RebaseReword)
-			}
-			if mn.Item("删除提交").Chosen() {
-				a.commit.openRebaseDialogPreset(a.updater(), oid+"~1", oid, git.RebaseDrop)
-			}
-			if mn.Item("压缩提交…").Chosen() {
-				a.commit.openRebaseDialogPreset(a.updater(), oid+"~1", oid, git.RebaseSquash)
-			}
-		}
-		if mn.Item("Revert 此提交").Chosen() {
-			a.commit.revertCommit(appCTX, a.updater(), oid)
-		}
-		mn.Separator()
-		if mn.Item("与本地比较").Chosen() {
-			a.compare.openForWorktree(repoPath, oid, "", a.updater())
-		}
-		if mn.Item("从此提交新建分支…").Chosen() {
-			a.newBranchFrom = oid
-			a.branchDialogOpen = true
-		}
-		if mn.Item("新建标签…").Chosen() {
-			a.branches.tagOpen = true
-			a.branches.tagName = ""
-			a.branches.tagTarget = cm.ShortOID
-			a.branches.tagMessage = ""
-			a.branches.tagErr = ""
-		}
-		if mn.Item("创建补丁…").Chosen() {
-			a.exportCommitPatch(oid, cm.ShortOID)
-		}
-		mn.Separator()
-		if mn.Item("推送此前所有提交…").Chosen() {
-			a.pushUpToOID = oid
-			a.pushUpToShort = cm.ShortOID
-			a.pushUpToOpen = true
-		}
-		if mn.Item("软重置到此提交").Chosen() {
-			a.commit.resetTo(appCTX, a.updater(), oid, git.ResetSoft)
-		}
-		if mn.Item("混合重置到此提交").Chosen() {
-			a.commit.resetTo(appCTX, a.updater(), oid, git.ResetMixed)
-		}
-		if mn.Item("硬重置到此提交").Chosen() {
-			a.commit.resetTo(appCTX, a.updater(), oid, git.ResetHard)
-		}
-		mn.Separator()
-		if mn.Item("转到子提交").Chosen() {
-			for _, k := range a.history.commits {
-				if len(k.Parents) > 0 && k.Parents[0] == oid {
-					a.history.scrollToCommit(k.OID, repoPath, a.updater())
-					break
-				}
-			}
-		}
-		if len(cm.Parents) > 0 && mn.Item("转到父提交").Chosen() {
-			a.history.scrollToCommit(cm.Parents[0], repoPath, a.updater())
-		}
-	})
-	rowEl.Children(func() {
-		ui.Column(c).Grow(1).Gap(2).Children(func() {
-			ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
-				ui.Text(c, cm.Subject).SingleLine().Grow(1)
-				// Signature badge — IDEA shows GPG verification on
-				// signed commits; hide for unsigned (N / "").
-				switch cm.Sig {
-				case git.SigGood:
-					display.Tag(c, "✓ 已签名", display.TagProps{Variant: display.TagBorderless, Color: display.TagSuccess})
-				case git.SigBad, git.SigRevoked:
-					display.Tag(c, "✗ 签名无效", display.TagProps{Variant: display.TagBorderless, Color: display.TagError})
-				case git.SigUnknown, git.SigExpired, git.SigCannot, git.SigError:
-					display.Tag(c, "? 签名", display.TagProps{Variant: display.TagBorderless, Color: display.TagWarning})
-				}
-				for _, ref := range cm.Refs {
-					display.Tag(c, ref, display.TagProps{
-						Variant: display.TagOutlined,
-						Color:   display.TagInfo,
-					})
-				}
-			})
-			ui.Row(c).Gap(8).Children(func() {
-				ui.Text(c, cm.ShortOID).FontSize(11).TextColor(t.TextMuted)
-				ui.Text(c, cm.Author).FontSize(11).TextColor(t.TextMuted)
-				ui.Text(c, relTime(cm.When)).FontSize(11).TextColor(t.TextMuted)
-				if a.history.unpushed[cm.OID] {
-					display.Tag(c, "未推送", display.TagProps{
-						Variant: display.TagBorderless,
-						Color:   display.TagInfo,
-					})
-				}
-				if cm.Merge() {
-					display.Tag(c, "合并", display.TagProps{
-						Variant: display.TagBorderless,
-						Color:   display.TagWarning,
-					})
-				}
-			})
-		})
-	})
-}
-
-// commitFilesPane: files of the selected commit.
-func (a *app) commitFilesPane(c *ui.Context, t *ui.Theme) {
-	m := &a.history
-	tk := theme.TokensOf(c)
-	ui.Column(c).Fill().Gap(0).Background(tk.BgContainer).Children(func() {
-		ui.Row(c).Padding(8, 12).Gap(8).Children(func() {
-			ui.Text(c, "文件").Bold()
-			if m.selectedID != "" {
-				ui.Text(c, shortOID(m.selectedID)).FontSize(11).TextColor(t.TextMuted)
-			}
-		})
-		switch {
-		case m.selectedID == "":
-			a.placeholder(c, t, "选择提交。")
-		case m.filesLoading:
-			a.placeholder(c, t, "正在加载文件…")
-		case m.filesErr != "":
-			ui.Column(c).Padding(8, 12).Children(func() {
-				feedback.Alert(c, m.filesErr, feedback.AlertProps{Type: feedback.Error, Variant: feedback.Soft})
-			})
-		case len(m.files) == 0:
-			a.placeholder(c, t, "无文件变更。")
-		default:
-			m.filesList.Key = func(row int) any { return m.files[row].Path }
-			ui.List(c, &m.filesList, len(m.files), func(i int) {
-				a.commitFileRowView(c, t, &m.files[i])
-			}).Grow(1)
-		}
-	})
-}
-
-// commitFileRowView: status tag + path; click loads the diff.
-func (a *app) commitFileRowView(c *ui.Context, t *ui.Theme, f *git.CommitFile) {
-	sel := a.history.selectedFile == f.Path
-	repoPath, oid := a.commit.RepoPath, a.history.selectedID
-	file := *f
-	label := f.Path
-	if f.OrigPath != "" {
-		label = f.OrigPath + " → " + f.Path
-	}
-	row := ui.Row(c).Key("hf-"+f.Path).FillWidth().Padding(6, 14).Gap(10).AlignItems(ui.Center).
-		Background(rowBg(t, sel))
-	row.Children(func() {
-		display.Tag(c, statusGlyph(f.StatusKind()), display.TagProps{
-			Variant: display.TagBorderless,
-			Color:   statusTagColor(f.StatusKind()),
-		})
-		ui.Text(c, label).SingleLine().
-			TextColor(rowLabelColor(t, sel)).
-			OnClick(func() {
-				a.diffState = nil
-				a.history.selectCommitFile(repoPath, oid, file, a.updater())
-			})
-	})
-	// IDEA: file in a commit can be compared against the worktree.
-	row.ContextMenu(func(mn *ui.Menu) {
-		if mn.Item("与工作区比较").Chosen() {
-			a.cmpDiffState = nil
-			a.openWorktreeCompare(file.Path, oid)
-		}
-	})
-}
-
-// --- 搁置（Stash/Shelf）页 ----------------------------------------------
-
-// shelfView: stash list | (files | diff).
-func (a *app) shelfView(c *ui.Context, t *ui.Theme) {
-	m := &a.shelf
-	m.ensureLoaded(a.commit.RepoPath, a.updater())
-
-	ui.Split(c, &a.shelfListW,
-		func() { a.stashListPane(c, t) },
-		func() {
-			ui.Split(c, &a.shelfFileW,
-				func() { a.stashFilesPane(c, t) },
-				func() {
-					a.renderDiffPane(c, t, diffSource{
-						selection: m.selectedFile,
-						loading:   m.diffLoading,
-						err:       m.diffErr,
-						diff:      m.diff,
-						emptyText: "选择搁置和文件查看变更。",
-					})
-				},
-			).Fill()
-		},
-	).Fill().Grow(1)
-}
-
-// stashListPane: header + new-stash form + stash rows.
-func (a *app) stashListPane(c *ui.Context, t *ui.Theme) {
-	m := &a.shelf
-	tk := theme.TokensOf(c)
-	ui.Column(c).Fill().Gap(0).Background(tk.BgContainer).Children(func() {
-		ui.Row(c).Padding(8, 12).Gap(8).AlignItems(ui.Center).Children(func() {
-			ui.Text(c, "搁置").Bold()
-			shelfBusy := m.loading || m.filesLoading || m.diffLoading
-			feedback.Spin(c, feedback.SpinProps{Size: theme.Small, Spinning: &shelfBusy}, nil)
-			ui.Text(c, "").Grow(1)
-			action.Button(c, "刷新", action.ButtonProps{Variant: action.Text, Size: theme.Small}).
-				Disabled(m.loading).OnClick(func() {
-				m.lastLoaded = ""
-				m.ensureLoaded(a.commit.RepoPath, a.updater())
-			})
-		})
-		// New-stash form.
-		ui.Column(c).Padding(6, 12).Gap(6).Children(func() {
-			field.Input(c, &m.msg, field.InputProps{
-				Placeholder: "搁置说明…",
-				Size:        theme.Small,
-			}).Grow(1)
-			ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
-				choice.Checkbox(c, &m.untracked, "含未跟踪", choice.CheckboxProps{Size: 12})
-				choice.Checkbox(c, &m.keepIndex, "保留已暂存", choice.CheckboxProps{Size: 12})
-				ui.Text(c, "").Grow(1)
-				action.Button(c, "清空", action.ButtonProps{Variant: action.Text, Size: theme.Small}).
-					Disabled(m.busy || len(m.stashes) == 0).OnClick(func() {
-					m.op(a.commit.RepoPath, a.updater(), "正在清空…", "已清空",
-						func(r *git.Repo) error {
-							res, err := r.StashClear(context.Background())
-							if err != nil {
-								return err
-							}
-							if !res.ExitOK() {
-								return &git.GitError{Args: res.Args, Stderr: res.OutputOfStderr()}
-							}
-							return nil
-						}, nil)
-				})
-				action.Button(c, "搁置", action.ButtonProps{Variant: action.Primary, Size: theme.Small}).
-					Disabled(m.busy).OnClick(func() {
-					m.op(a.commit.RepoPath, a.updater(), "正在搁置…", "已搁置",
-						func(r *git.Repo) error {
-							res, err := r.StashPush(context.Background(), git.StashPushRequest{
-								Message:          m.msg,
-								IncludeUntracked: m.untracked,
-								KeepIndex:        m.keepIndex,
-							})
-							if err != nil {
-								return err
-							}
-							if !res.ExitOK() {
-								return &git.GitError{Args: res.Args, Stderr: res.OutputOfStderr()}
-							}
-							return nil
-						},
-						func() {
-							m.msg = ""
-							// Worktree changed — refresh the commit tab.
-							a.commit.refresh(appCTX, a.updater())
-						})
-				})
-			})
-		})
-		if m.err != "" {
-			ui.Column(c).Padding(6, 12).Children(func() {
-				feedback.Alert(c, m.err, feedback.AlertProps{Type: feedback.Error, Variant: feedback.Soft})
-			})
-		}
-		if m.syncOK != "" {
-			ui.Row(c).Padding(4, 12).Children(func() {
-				display.Tag(c, "✓ "+m.syncOK, display.TagProps{Variant: display.TagBorderless, Color: display.TagSuccess})
-			})
-		}
-		switch {
-		case m.loading && len(m.stashes) == 0 && len(m.shelf) == 0:
-			a.placeholder(c, t, "正在加载搁置…")
-		case len(m.stashes) == 0 && len(m.shelf) == 0:
-			display.Empty(c, display.EmptyProps{
-				Title:       "暂无搁置",
-				Description: "把当前修改搁置起来以便稍后恢复",
-			}).Padding(24)
-		default:
-			layout.ScrollArea(c, layout.ScrollAreaProps{}, func() {
-				ui.Column(c).FillWidth().Children(func() {
-					if len(m.shelf) > 0 {
-						ui.Row(c).FillWidth().Padding(6, 14, 2, 14).Children(func() {
-							ui.Text(c, "搁置架").FontSize(11).Bold().TextColor(t.TextMuted)
-						})
-						for i := range m.shelf {
-							a.shelfRowView(c, t, &m.shelf[i])
-						}
-					}
-					if len(m.stashes) > 0 {
-						ui.Row(c).FillWidth().Padding(6, 14, 2, 14).Children(func() {
-							ui.Text(c, "Stash").FontSize(11).Bold().TextColor(t.TextMuted)
-						})
-						for i := range m.stashes {
-							a.stashRowView(c, t, &m.stashes[i])
-						}
-					}
-				})
-			}).Grow(1)
-		}
-	})
-}
-
-// shelfRowView: one patch-shelf entry + unshelve/drop menu.
-func (a *app) shelfRowView(c *ui.Context, t *ui.Theme, se *git.ShelfEntry) {
-	m := &a.shelf
-	sel := m.isShelf && m.selectedID == "shelf:"+se.Name
-	repoPath := a.commit.RepoPath
-	name := se.Name
-	rowEl := ui.Row(c).Key("shelf-"+name).FillWidth().Padding(7, 14).Gap(8).AlignItems(ui.Center).
-		Background(rowBg(t, sel))
-	rowEl.Children(func() {
-		ui.Column(c).Grow(1).Gap(2).Children(func() {
-			ui.Text(c, "📦 "+name).SingleLine()
-			ui.Text(c, se.Created.Format("01-02 15:04")).FontSize(11).TextColor(t.TextMuted)
-		})
-	})
-	rowEl.OnClick(func() {
-		m.selectShelfEntry(repoPath, name, a.updater())
-	})
-	rowEl.ContextMenu(func(mn *ui.Menu) {
-		if mn.Item("取消搁置（应用补丁）").Chosen() {
-			m.op(repoPath, a.updater(), "正在取消搁置…", "已取消搁置",
-				func(r *git.Repo) error {
-					res, err := r.Unshelve(context.Background(), name)
-					if err != nil {
-						return err
-					}
-					if !res.ExitOK() {
-						return &git.GitError{Args: res.Args, Stderr: res.OutputOfStderr()}
-					}
-					return nil
-				},
-				func() { a.commit.refresh(appCTX, a.updater()) })
-		}
-		mn.Separator()
-		if mn.Item("删除").Chosen() {
-			m.op(repoPath, a.updater(), "正在删除…", "已删除",
-				func(r *git.Repo) error { return r.DropShelf(context.Background(), name) }, nil)
-		}
-	})
-}
-
-// stashRowView: one stash entry + context menu actions.
-func (a *app) stashRowView(c *ui.Context, t *ui.Theme, st *git.Stash) {
-	m := &a.shelf
-	sel := m.selectedID == st.Name
-	repoPath := a.commit.RepoPath
-	name := st.Name
-	rowEl := ui.Row(c).Key("st-"+name).FillWidth().Padding(7, 14).Gap(8).AlignItems(ui.Center).
-		Background(rowBg(t, sel))
-	rowEl.Children(func() {
-		ui.Column(c).Grow(1).Gap(2).Children(func() {
-			ui.Text(c, st.Message).SingleLine().Grow(1)
-			ui.Row(c).Gap(6).Children(func() {
-				ui.Text(c, name).FontSize(11).TextColor(t.TextMuted)
-				if st.Branch != "" {
-					display.Tag(c, st.Branch, display.TagProps{
-						Variant: display.TagBorderless, Color: display.TagInfo,
-					})
-				}
-			})
-		})
-	})
-	rowEl.OnClick(func() {
-		a.diffState = nil
-		m.selectStash(repoPath, name, a.updater())
-	})
-	rowEl.ContextMenu(func(mn *ui.Menu) {
-		if mn.Item("应用").Chosen() {
-			m.op(repoPath, a.updater(), "正在应用…", "已应用",
-				func(r *git.Repo) error { _, err := r.StashApply(context.Background(), name); return err },
-				func() { a.commit.refresh(appCTX, a.updater()) })
-		}
-		if mn.Item("弹出").Chosen() {
-			m.op(repoPath, a.updater(), "正在弹出…", "已弹出",
-				func(r *git.Repo) error { _, err := r.StashPop(context.Background(), name); return err },
-				func() { a.commit.refresh(appCTX, a.updater()) })
-		}
-		mn.Separator()
-		if mn.Item("从 stash 建分支…").Chosen() {
-			a.newBranchFrom = "" // base = stash's parent commit; branch name asked below
-			a.stashBranchFrom = name
-			a.stashBranchOpen = true
-			a.stashBranchName = ""
-		}
-		mn.Separator()
-		if mn.Item("删除").Chosen() {
-			m.op(repoPath, a.updater(), "正在删除…", "已删除",
-				func(r *git.Repo) error { _, err := r.StashDrop(context.Background(), name); return err }, nil)
-		}
-	})
-}
-
-// stashFilesPane: files inside the selected stash.
-func (a *app) stashFilesPane(c *ui.Context, t *ui.Theme) {
-	m := &a.shelf
-	tk := theme.TokensOf(c)
-	ui.Column(c).Fill().Gap(0).Background(tk.BgContainer).Children(func() {
-		ui.Row(c).Padding(8, 12).Gap(8).Children(func() {
-			ui.Text(c, "文件").Bold()
-			if m.selectedID != "" {
-				ui.Text(c, m.selectedID).FontSize(11).TextColor(t.TextMuted)
-			}
-		})
-		switch {
-		case m.selectedID == "":
-			a.placeholder(c, t, "选择搁置。")
-		case m.filesLoading:
-			a.placeholder(c, t, "正在加载文件…")
-		case m.filesErr != "":
-			ui.Column(c).Padding(8, 12).Children(func() {
-				feedback.Alert(c, m.filesErr, feedback.AlertProps{Type: feedback.Error, Variant: feedback.Soft})
-			})
-		case len(m.files) == 0:
-			a.placeholder(c, t, "无文件变更。")
-		default:
-			layout.ScrollArea(c, layout.ScrollAreaProps{}, func() {
-				ui.Column(c).FillWidth().Children(func() {
-					for i := range m.files {
-						a.stashFileRowView(c, t, &m.files[i])
-					}
-				})
-			}).Grow(1)
-		}
-	})
-}
-
-// stashFileRowView: status tag + path; click loads the diff.
-func (a *app) stashFileRowView(c *ui.Context, t *ui.Theme, f *git.StashFile) {
-	m := &a.shelf
-	sel := m.selectedFile == f.Path
-	repoPath, stashName := a.commit.RepoPath, m.selectedID
-	file := *f
-	label := f.Path
-	if f.OrigPath != "" {
-		label = f.OrigPath + " → " + f.Path
-	}
-	kind := stashFileKind(f)
-	ui.Row(c).Key("shf-"+f.Path).FillWidth().Padding(6, 14).Gap(10).AlignItems(ui.Center).
-		Background(rowBg(t, sel)).
-		Children(func() {
-			display.Tag(c, statusGlyph(kind), display.TagProps{
-				Variant: display.TagBorderless, Color: statusTagColor(kind),
-			})
-			ui.Text(c, label).SingleLine().
-				TextColor(rowLabelColor(t, sel)).
-				OnClick(func() {
-					a.diffState = nil
-					m.selectFile(repoPath, stashName, file, a.updater())
-				})
-		})
-}
-
-// stashFileKind maps a stash file's status to the shared FileKind set.
-func stashFileKind(f *git.StashFile) git.FileKind {
-	if f.Untracked {
-		return git.KindUntracked
-	}
-	switch f.Status {
-	case 'A':
-		return git.KindAdded
-	case 'D':
-		return git.KindDeleted
-	case 'R':
-		return git.KindRenamed
-	case 'T':
-		return git.KindTypechange
-	}
-	return git.KindModified
-}
-
-// --- 分支（Branches）弹出菜单 -------------------------------------------
-//
-// IDEA 把分支树放在 header 分支名按钮的下拉菜单里，不是独立面板。
-// 每条本地/远程分支是一个 Submenu，项即原分支页的右键操作。
-
-// branchPopupMenu builds the branches dropdown under the header tag.
-//
-// IDEA's Branches popup: New Branch/Tag on top, then local branches,
-// remote branches, tags, submodules and worktrees — every ref a submenu
-// holding the ops the old tab's context menu had.
-func (a *app) branchPopupMenu(mn *ui.Menu) {
-	m := &a.branches
-	repoPath := a.commit.RepoPath
-	m.ensureLoaded(repoPath, a.updater())
-
-	mn.MaxWidth(320)
-	if mn.Item("新建分支…").Chosen() {
-		a.newBranchFrom = ""
-		a.branchDialogKind = 2 // create + checkout
-		a.branchDialogOpen = true
-	}
-	if mn.Item("新建标签…").Chosen() {
-		m.tagOpen = true
-		m.tagName, m.tagTarget, m.tagMessage, m.tagErr = "", "", "", ""
-	}
-	if mn.Item("管理远程…").Chosen() {
-		m.remoteOpen = true
-		m.remoteErr = ""
-		m.remoteEdit = ""
-		m.remoteName, m.remoteURL = "", ""
-		m.loadRemotes(repoPath, a.updater())
-	}
-	if mn.Item("新建工作树…").Chosen() {
-		m.wtOpen = true
-		m.wtPath, m.wtRef, m.wtBranch, m.wtErr = "", "", "", ""
-	}
-	if mn.Item("刷新").Chosen() {
-		m.lastLoaded = ""
-		m.ensureLoaded(repoPath, a.updater())
-	}
-	mn.Separator()
-	if m.loading {
-		mn.Item("正在加载分支…").Disabled(true)
-		return
-	}
-	if m.err != "" {
-		mn.Item("加载失败：" + m.err).Disabled(true)
-	}
-	if len(m.local) == 0 && len(m.remote) == 0 && len(m.tags) == 0 {
-		mn.Item("（无分支）").Disabled(true)
-		return
-	}
-	// 本地分支
-	for i := range m.local {
-		b := m.local[i]
-		label := b.Name
-		if b.Current {
-			label = "✓ " + label
-		}
-		if b.HasTrack && (b.Ahead > 0 || b.Behind > 0) {
-			label += fmt.Sprintf("  +%d −%d", b.Ahead, b.Behind)
-		}
-		mn.Submenu(label, func(sub *ui.Menu) { a.localBranchMenu(sub, &b) })
-	}
-	if len(m.remote) > 0 {
-		mn.Separator()
-		mn.Submenu("远程分支", func(sub *ui.Menu) {
-			for i := range m.remote {
-				b := m.remote[i]
-				sub.Submenu(b.Name, func(s2 *ui.Menu) { a.remoteBranchMenu(s2, &b) })
-			}
-		})
-	}
-	if len(m.tags) > 0 {
-		mn.Separator()
-		mn.Submenu("标签", func(sub *ui.Menu) {
-			for i := range m.tags {
-				tg := m.tags[i]
-				sub.Submenu(tg.Name, func(s2 *ui.Menu) { a.tagMenu(s2, &tg) })
-			}
-		})
-	}
-	if len(m.submodules) > 0 {
-		mn.Separator()
-		mn.Submenu("子模块", func(sub *ui.Menu) {
-			for i := range m.submodules {
-				sm := m.submodules[i]
-				sub.Submenu(sm.Path, func(s2 *ui.Menu) { a.submoduleMenu(s2, &sm) })
-			}
-		})
-	}
-	if len(m.worktrees) > 0 {
-		mn.Separator()
-		mn.Submenu("工作树", func(sub *ui.Menu) {
-			for i := range m.worktrees {
-				wt := m.worktrees[i]
-				label := wt.Path
-				if wt.IsMain {
-					label += "（主）"
-				}
-				sub.Submenu(label, func(s2 *ui.Menu) { a.worktreeMenu(s2, &wt) })
-			}
-		})
-	}
-}
-
-// localBranchMenu: ops on one local branch (checkout/merge/rebase/…).
-func (a *app) localBranchMenu(sub *ui.Menu, b *git.Branch) {
-	m := &a.branches
-	repoPath := a.commit.RepoPath
-	name := b.Name
-	if !b.Current {
-		if sub.Item("切换到此分支").Chosen() {
-			m.op(repoPath, a.updater(), "正在切换…", "已切换",
-				func(r *git.Repo) (*git.RunResult, error) {
-					return r.Checkout(context.Background(), name, false)
-				},
-				func() { a.commit.refresh(appCTX, a.updater()) })
-		}
-	}
-	if sub.Item("合并到当前分支").Chosen() {
-		m.op(repoPath, a.updater(), "正在合并…", "已合并",
-			func(r *git.Repo) (*git.RunResult, error) {
-				return r.MergeIntoCurrent(context.Background(), name)
-			},
-			func() { a.commit.refresh(appCTX, a.updater()) })
-	}
-	if sub.Item("变基到此分支").Chosen() {
-		a.commit.rebase(appCTX, a.updater(), name)
-	}
-	sub.Separator()
-	if sub.Item("与当前分支比较").Chosen() {
-		a.cmpDiffState = nil
-		a.compare.openFor(repoPath, name, a.updater())
-	}
-	if sub.Item("与其他分支比较…").Chosen() {
-		a.cmpDiffState = nil
-		a.branchCmpFrom = name
-		a.branchCmpOpen = true
-		a.branchCmpInput = ""
-	}
-	if sub.Item("重命名…").Chosen() {
-		m.renameOpen = true
-		m.renameOld = name
-		m.renameNew = name
-	}
-	sub.Separator()
-	if sub.Item("删除").Chosen() {
-		m.op(repoPath, a.updater(), "正在删除…", "已删除",
-			func(r *git.Repo) (*git.RunResult, error) {
-				return r.DeleteBranch(context.Background(), name, false)
-			}, nil)
-	}
-}
-
-// remoteBranchMenu: the one op remote branches support — track locally.
-func (a *app) remoteBranchMenu(sub *ui.Menu, b *git.Branch) {
-	m := &a.branches
-	repoPath := a.commit.RepoPath
-	name := b.Name
-	if sub.Item("从远程创建本地分支").Chosen() {
-		local := strings.TrimPrefix(name, "origin/")
-		m.op(repoPath, a.updater(), "正在创建…", "已创建",
-			func(r *git.Repo) (*git.RunResult, error) {
-				return r.RunOK(context.Background(), "switch", "-c", local, "--track", name)
-			},
-			func() { a.commit.refresh(appCTX, a.updater()) })
-	}
-}
-
-// tagMenu: checkout / push / delete for one tag.
-func (a *app) tagMenu(sub *ui.Menu, tg *git.Tag) {
-	m := &a.branches
-	repoPath := a.commit.RepoPath
-	name := tg.Name
-	if sub.Item("检出（分离 HEAD）").Chosen() {
-		m.op(repoPath, a.updater(), "正在检出…", "已检出",
-			func(r *git.Repo) (*git.RunResult, error) {
-				return r.CheckoutTag(context.Background(), name)
-			},
-			func() { a.commit.refresh(appCTX, a.updater()) })
-	}
-	if sub.Item("推送到远程").Chosen() {
-		m.op(repoPath, a.updater(), "正在推送…", "已推送",
-			func(r *git.Repo) (*git.RunResult, error) {
-				return r.PushTag(context.Background(), "origin", name)
-			}, nil)
-	}
-	sub.Separator()
-	if sub.Item("删除").Chosen() {
-		m.op(repoPath, a.updater(), "正在删除…", "已删除",
-			func(r *git.Repo) (*git.RunResult, error) {
-				return r.DeleteTag(context.Background(), name)
-			}, nil)
-	}
-}
-
-// submoduleMenu: init/update for one submodule.
-func (a *app) submoduleMenu(sub *ui.Menu, sm *git.Submodule) {
-	m := &a.branches
-	repoPath := a.commit.RepoPath
-	path := sm.Path
-	state := "未初始化"
-	if sm.Unmerged {
-		state = "冲突"
-	} else if sm.Init && sm.Dirty {
-		state = "已检出（有改动）"
-	} else if sm.Init {
-		state = "已检出"
-	}
-	sub.Item("状态：" + state).Disabled(true)
-	if !sm.Init || sm.Dirty {
-		if sub.Item("更新（init + checkout）").Chosen() {
-			m.op(repoPath, a.updater(), "正在更新子模块…", "已更新",
-				func(r *git.Repo) (*git.RunResult, error) {
-					return r.SubmoduleUpdate(context.Background(), path)
-				},
-				func() { a.commit.refresh(appCTX, a.updater()) })
-		}
-	}
-}
-
-// worktreeMenu: open-in-window / remove for one linked worktree.
-func (a *app) worktreeMenu(sub *ui.Menu, wt *git.Worktree) {
-	m := &a.branches
-	repoPath := a.commit.RepoPath
-	if !wt.IsMain && sub.Item("在新窗口打开此 worktree").Chosen() {
-		spawnWindow(wt.Path)
-	}
-	if wt.IsMain {
-		return
-	}
-	sub.Separator()
-	if sub.Item("移除").Chosen() {
-		m.op(repoPath, a.updater(), "正在移除 worktree…", "已移除",
-			func(r *git.Repo) (*git.RunResult, error) {
-				return r.RemoveWorktree(context.Background(), wt.Path, false)
-			}, nil)
-	}
-	if sub.Item("强制移除（丢弃改动）").Chosen() {
-		m.op(repoPath, a.updater(), "正在强制移除…", "已移除",
-			func(r *git.Repo) (*git.RunResult, error) {
-				return r.RemoveWorktree(context.Background(), wt.Path, true)
-			}, nil)
-	}
-}
-
-// createBranch makes + checks out a new local branch. The op's after
-// hook runs after the refresh landed — but the user shouldn't wait for
-// a git call to see the new branch appear, so we optimistically insert
-// it into m.local right away; the async reload reconciles.
-func (a *app) createBranch() {
-	m := &a.branches
-	name := strings.TrimSpace(m.newName)
-	if name == "" {
-		return
-	}
-	// Optimistic insert — IDEA updates the branch tree as soon as the
-	// mutation returns, before the next status reload lands.
-	exists := false
-	for _, b := range m.local {
-		if b.Name == name {
-			exists = true
-			break
-		}
-	}
-	if !exists {
-		m.local = append(m.local, git.Branch{Name: name})
-	}
-	m.op(a.commit.RepoPath, a.updater(), "正在创建…", "已创建并切换",
-		func(r *git.Repo) (*git.RunResult, error) { return r.Checkout(context.Background(), name, true) },
-		func() {
-			m.newName = ""
-			a.commit.refresh(appCTX, a.updater()) // HEAD moved
-		})
-}
-
-// worktreeDialog collects path + ref + optional new-branch for
-// `git worktree add`.
-func (a *app) worktreeDialog(c *ui.Context, t *ui.Theme) {
-	m := &a.branches
-	if feedback.Modal(c, &m.wtOpen, feedback.ModalProps{
-		Title: "新建工作树", Width: 480, OkText: "添加",
-	}, func() {
-		ui.Column(c).Gap(8).Children(func() {
-			ui.Row(c).Gap(6).Children(func() {
-				field.Input(c, &m.wtPath, field.InputProps{
-					Placeholder: "目标目录路径…", Size: theme.Middle,
-				}).Grow(1).OnSubmit(func() { a.confirmWorktree() })
-				action.Button(c, "浏览…", action.ButtonProps{Variant: action.Default, Size: theme.Middle}).
-					OnClick(func() {
-						dirs, err := mygo.Dialog.Open(mygo.OpenDialogOptions{
-							Title:     "选择 worktree 目录",
-							Directory: true,
-							Parent:    a.win,
-						})
-						if err == nil && len(dirs) > 0 {
-							m.wtPath = dirs[0]
-						}
-					})
-			})
-			field.Input(c, &m.wtRef, field.InputProps{
-				Placeholder: "基于 ref（默认 HEAD）…", Size: theme.Middle,
-			}).Grow(1).OnSubmit(func() { a.confirmWorktree() })
-			field.Input(c, &m.wtBranch, field.InputProps{
-				Placeholder: "新分支名（可空）…", Size: theme.Middle,
-			}).Grow(1).OnSubmit(func() { a.confirmWorktree() })
-			if m.wtErr != "" {
-				feedback.Alert(c, m.wtErr, feedback.AlertProps{Type: feedback.Error, Variant: feedback.Soft})
-			}
-		})
-	}) {
-		a.confirmWorktree()
-	}
-}
-
-func (a *app) confirmWorktree() bool {
-	m := &a.branches
-	path := strings.TrimSpace(m.wtPath)
-	if path == "" {
-		m.wtErr = "请填写目录路径"
-		return false
-	}
-	ref := strings.TrimSpace(m.wtRef)
-	branch := strings.TrimSpace(m.wtBranch)
-	m.wtOpen = false
-	m.op(a.commit.RepoPath, a.updater(), "正在创建工作树…", "已添加",
-		func(r *git.Repo) (*git.RunResult, error) {
-			return r.AddWorktree(context.Background(), path, ref, branch)
-		}, func() {
-			m.wtErr = ""
-		})
-	return true
-}
-
-// tagDialog collects a new tag's name/target/message (IDEA: New Tag…).
-func (a *app) tagDialog(c *ui.Context, t *ui.Theme) {
-	m := &a.branches
-	confirmed := feedback.Modal(c, &m.tagOpen, feedback.ModalProps{
-		Title:  "新建标签",
-		Width:  460,
-		OkText: "创建",
-	}, func() {
-		ui.Column(c).Gap(10).Children(func() {
-			if m.tagErr != "" {
-				feedback.Alert(c, m.tagErr, feedback.AlertProps{Type: feedback.Error, Variant: feedback.Soft})
-			}
-			field.Input(c, &m.tagName, field.InputProps{Placeholder: "标签名（如 v1.0）"})
-			field.Input(c, &m.tagTarget, field.InputProps{Placeholder: "目标提交（默认 HEAD）"})
-			field.Input(c, &m.tagMessage, field.InputProps{Placeholder: "附注信息（留空 = 轻量标签）"})
-			choice.Checkbox(c, &m.tagCheckout, "创建后检出", choice.CheckboxProps{Size: 14})
-		})
-	})
-	if confirmed {
-		a.createTag()
-	}
-}
-
-// gotoDialogView is IDEA's "Go to Hash/Branch/Tag".
-func (a *app) gotoDialogView(c *ui.Context, t *ui.Theme) {
-	m := &a.history
-	confirmed := feedback.Modal(c, &m.gotoOpen, feedback.ModalProps{
-		Title:  "跳转到提交",
-		Width:  420,
-		OkText: "跳转",
-	}, func() {
-		ui.Column(c).Gap(8).Children(func() {
-			if m.gotoErr != "" {
-				feedback.Alert(c, m.gotoErr, feedback.AlertProps{Type: feedback.Error, Variant: feedback.Soft})
-			}
-			ui.Text(c, "提交哈希、分支名或标签名：").FontSize(12).TextColor(t.TextMuted)
-			field.Input(c, &m.gotoInput, field.InputProps{
-				Placeholder: "如 abc1234 / main / v1.0",
-				Size:        theme.Middle,
-			}).Grow(1).OnSubmit(func() {
-				m.gotoCommit(a.commit.RepoPath, strings.TrimSpace(m.gotoInput), a.updater())
-			})
-		})
-	})
-	if confirmed {
-		m.gotoCommit(a.commit.RepoPath, strings.TrimSpace(m.gotoInput), a.updater())
-	}
-}
-
-// exportWorktreePatch writes one file's working-tree diff to a .patch.
-func (a *app) exportWorktreePatch(path string) {
-	gen := a.commit.gen
-	w := a.updater()
-	repoPath := a.commit.RepoPath
-	go func() {
-		dest, err := mygo.Dialog.Save(mygo.SaveDialogOptions{
-			Parent:      a.win,
-			Title:       "导出补丁",
-			DefaultPath: repoPath + "/" + filepath.Base(path) + ".patch",
-			Filters:     []mygo.FileFilter{{Name: "补丁", Extensions: []string{"patch"}}},
-		})
-		w.update(func() {
-			if gen != a.commit.gen || err != nil || dest == "" {
-				return
-			}
-			a.commit.createPatch(appCTX, w, []string{path}, "", dest)
-		})
-	}()
-}
-
-// exportCommitPatch asks for a destination dir then exports the commit.
-func (a *app) exportCommitPatch(oid, short string) {
-	gen := a.commit.gen
-	w := a.updater()
-	repoPath := a.commit.RepoPath
-	go func() {
-		dest, err := mygo.Dialog.Save(mygo.SaveDialogOptions{
-			Parent:      a.win,
-			Title:       "导出补丁",
-			DefaultPath: repoPath + "/" + short + ".patch",
-			Filters:     []mygo.FileFilter{{Name: "补丁", Extensions: []string{"patch"}}},
-		})
-		w.update(func() {
-			if gen != a.commit.gen || err != nil || dest == "" {
-				return
-			}
-			a.commit.createPatch(appCTX, w, nil, oid, dest)
-		})
-	}()
-}
-
-// openApplyPatch picks a .patch file and applies it (IDEA: Apply Patch…).
-func (a *app) openApplyPatch() {
-	gen := a.commit.gen
-	w := a.updater()
-	go func() {
-		paths, err := mygo.Dialog.Open(mygo.OpenDialogOptions{
-			Parent:  a.win,
-			Title:   "应用补丁",
-			Message: "选择 .patch 文件",
-			Filters: []mygo.FileFilter{{Name: "补丁", Extensions: []string{"patch", "diff"}}},
-		})
-		w.update(func() {
-			if gen != a.commit.gen || err != nil || len(paths) == 0 {
-				return
-			}
-			a.commit.applyPatch(appCTX, w, paths[0])
-		})
-	}()
-}
-
-// pullDialogView renders IDEA's "Update Project": merge/rebase choice
-// and the stash-before-update option.
-func (a *app) pullDialogView(c *ui.Context, t *ui.Theme) {
-	m := &a.commit
-	d := &m.pullDlg
-	confirmed := feedback.Modal(c, &d.Open, feedback.ModalProps{
-		Title:  "更新项目",
-		Width:  480,
-		OkText: "拉取",
-	}, func() {
-		ui.Column(c).Gap(10).Children(func() {
-			target := d.Branch
-			if d.Upstream != "" {
-				target += " ← " + d.Upstream
-			}
-			ui.Text(c, target).Bold()
-			ui.Text(c, "更新方式：").FontSize(12).TextColor(t.TextMuted)
-			ui.Column(c).Gap(6).Padding(0, 0, 0, 8).Children(func() {
-				choice.Radio(c, &d.Rebase, false, "合并（merge）—— 上游提交合并进来", choice.RadioProps{})
-				choice.Radio(c, &d.Rebase, true, "变基（rebase）—— 本地提交重放到上游之上", choice.RadioProps{})
-			})
-			choice.Checkbox(c, &d.Autostash, "更新前暂存未提交的改动（--autostash）", choice.CheckboxProps{Size: 14})
-			if d.Dirty {
-				ui.Text(c, "检测到未提交的改动。").FontSize(11).TextColor(t.TextMuted)
-			}
-		})
-	})
-	if confirmed {
-		m.doPull(appCTX, a.updater())
-	}
-}
-
-// pushDialogView renders IDEA's push confirmation: target, commit
-// preview, force-with-lease + tags toggles.
-func (a *app) pushDialogView(c *ui.Context, t *ui.Theme) {
-	m := &a.commit
-	d := &m.pushDlg
-	confirmed := feedback.Modal(c, &d.Open, feedback.ModalProps{
-		Title:      "推送到远程",
-		Width:      560,
-		OkText:     "推送",
-		CancelText: "取消",
-		NoFooter:   false,
-	}, func() {
-		ui.Column(c).Gap(10).Children(func() {
-			switch {
-			case d.Loading:
-				a.placeholder(c, t, "正在检查上游…")
-			case d.Err != "":
-				feedback.Alert(c, d.Err, feedback.AlertProps{Type: feedback.Error, Variant: feedback.Soft})
-			default:
-				target := "origin"
-				if d.HasUpstream {
-					target = d.Upstream
-				}
-				ui.Text(c, "当前分支 → "+target).Bold()
-				if !d.HasUpstream {
-					ui.Text(c, "没有上游分支：将以 -u 发布到 origin。").FontSize(12).TextColor(t.TextMuted)
-				}
-				if d.Diverged {
-					feedback.Alert(c,
-						"历史已被改写（amend/变基），与远程分叉。推送需要 force-with-lease。",
-						feedback.AlertProps{Type: feedback.Warning, Variant: feedback.Soft})
-				}
-				ui.Text(c, fmt.Sprintf("将推送 %d 个提交：", len(d.Commits))).FontSize(12)
-				ui.Column(c).Border(1, theme.TokensOf(c).BorderSecondary).Radius(6).Padding(6).MaxHeight(180).Children(func() {
-					layout.ScrollArea(c, layout.ScrollAreaProps{}, func() {
-						ui.Column(c).Gap(2).Children(func() {
-							if len(d.Commits) == 0 {
-								ui.Text(c, "（没有需要推送的提交）").FontSize(12).TextColor(t.TextMuted)
-							}
-							for i := range d.Commits {
-								cm := &d.Commits[i]
-								ui.Row(c).Gap(8).Children(func() {
-									ui.Text(c, cm.ShortOID).FontSize(11).TextColor(t.TextMuted)
-									ui.Text(c, cm.Subject).FontSize(12).SingleLine()
-								})
-							}
-						})
-					}).Grow(1)
-				})
-				ui.Row(c).Gap(14).Children(func() {
-					choice.Checkbox(c, &d.Force, "强制推送（--force-with-lease）", choice.CheckboxProps{Size: 14})
-					choice.Checkbox(c, &d.PushTags, "同时推送标签", choice.CheckboxProps{Size: 14})
-				})
-			}
-		})
-	})
-	if confirmed && !d.Loading && d.Err == "" {
-		if d.afterCommit {
-			m.commitThenPush(appCTX, a.updater())
-		} else {
-			m.doPush(appCTX, a.updater())
-		}
-	}
-}
-
-// rebaseDialogView renders the interactive-rebase plan (IDEA's
-// "Rebasing Commits" panel): one row per commit with an action picker
-// and up/down reordering.
-func (a *app) rebaseDialogView(c *ui.Context, t *ui.Theme) {
-	m := &a.commit
-	d := &m.rebaseDlg
-	confirmed := feedback.Modal(c, &d.Open, feedback.ModalProps{
-		Title:  "交互式变基 — " + shortOID(d.Onto),
-		Width:  720,
-		OkText: "开始变基",
-	}, func() {
-		ui.Column(c).Gap(8).Children(func() {
-			ui.Text(c, "调整每条提交的动作；拖动/上移下移改变顺序（从上到下执行）。​").
-				FontSize(12).TextColor(t.TextMuted)
-			ui.Column(c).Border(1, theme.TokensOf(c).BorderSecondary).Radius(6).Children(func() {
-				layout.ScrollArea(c, layout.ScrollAreaProps{}, func() {
-					ui.Column(c).FillWidth().Children(func() {
-						for i := range d.Entries {
-							a.rebaseEntryRow(c, t, i)
-						}
-					})
-				}).Grow(1).MinHeight(240)
-			})
-		})
-	})
-	if confirmed {
-		m.runInteractiveRebase(appCTX, a.updater())
-	}
-}
-
-// rebaseEntryRow: one commit row — action dropdown + subject + reorder.
-func (a *app) rebaseEntryRow(c *ui.Context, t *ui.Theme, i int) {
-	d := &a.commit.rebaseDlg
-	e := &d.Entries[i]
-	ui.Row(c).FillWidth().Padding(6, 10).Gap(8).AlignItems(ui.Center).
-		Children(func() {
-			// Action picker — IDEA shows a dropdown.
-			actions := []git.RebaseAction{
-				git.RebasePick, git.RebaseReword, git.RebaseEdit,
-				git.RebaseSquash, git.RebaseFixup, git.RebaseDrop,
-			}
-			ui.Column(c).MinWidth(120).Children(func() {
-				cur := string(e.Action)
-				if cur == "" {
-					cur = "pick"
-				}
-				ui.Text(c, "▾ "+cur).FontSize(12).Bold()
-			}).ContextMenu(func(mn *ui.Menu) {
-				for _, act := range actions {
-					a := act
-					if mn.Item(string(a)).Chosen() {
-						e.Action = a
-					}
-				}
-			})
-			ui.Text(c, e.Short).FontSize(11).TextColor(t.TextMuted)
-			ui.Text(c, e.Subject).FontSize(12).SingleLine().Grow(1)
-			if e.Action == git.RebaseReword {
-				field.Input(c, &e.Message, field.InputProps{
-					Placeholder: "新的提交信息…",
-					Size:        theme.Small,
-				}).MinWidth(200)
-			}
-			ui.Column(c).Gap(2).Children(func() {
-				action.Button(c, "↑", action.ButtonProps{Variant: action.Text, Size: theme.Small}).
-					Disabled(i == 0).OnClick(func() {
-					d.Entries[i-1], d.Entries[i] = d.Entries[i], d.Entries[i-1]
-				})
-				action.Button(c, "↓", action.ButtonProps{Variant: action.Text, Size: theme.Small}).
-					Disabled(i == len(d.Entries)-1).OnClick(func() {
-					d.Entries[i+1], d.Entries[i] = d.Entries[i], d.Entries[i+1]
-				})
-			})
-		})
-}
-
-// createTag runs git tag then refreshes both panes.
-func (a *app) createTag() {
-	m := &a.branches
-	name := strings.TrimSpace(m.tagName)
-	if name == "" {
-		m.tagErr = "请输入标签名"
-		return
-	}
-	target := strings.TrimSpace(m.tagTarget)
-	msg := m.tagMessage
-	checkout := m.tagCheckout
-	m.op(a.commit.RepoPath, a.updater(), "正在创建…", "已创建标签",
-		func(r *git.Repo) (*git.RunResult, error) {
-			return r.CreateTag(context.Background(), name, target, msg)
-		},
-		func() {
-			m.tagOpen = false
-			m.tagErr = ""
-			if checkout {
-				m.op(a.commit.RepoPath, a.updater(), "正在检出…", "已检出",
-					func(r *git.Repo) (*git.RunResult, error) {
-						return r.CheckoutTag(context.Background(), name)
-					},
-					func() { a.commit.refresh(appCTX, a.updater()) })
-			}
-		})
-}
-
-// openWorktreeCompare diffs path at ref (commit/branch) against the
-// worktree — IDEA's "Compare with Local".
-func (a *app) openWorktreeCompare(path, ref string) {
-	a.cmpDiffState = nil
-	a.compare.openForWorktree(a.commit.RepoPath, ref, path, a.updater())
-}
-
-// bisectOverlay renders IDEA's Bisect panel: start form when inactive,
-// good/bad/skip/reset controls plus the current candidate when running.
-func (a *app) bisectOverlay(c *ui.Context, t *ui.Theme) {
-	m := &a.commit
-	feedback.Modal(c, &m.bisectOpen, feedback.ModalProps{
-		Title:    "Bisect — 二分查找",
-		Width:    560,
-		NoFooter: true,
-	}, func() {
-		ui.Column(c).Gap(12).MinHeight(200).Children(func() {
-			if m.bisectErr != "" {
-				feedback.Alert(c, m.bisectErr, feedback.AlertProps{Type: feedback.Error, Variant: feedback.Soft})
-			}
-			st := m.bisect
-			if st == nil || !st.Active {
-				// Start form.
-				ui.Text(c, "标记一个「好」提交和一个「坏」提交，Git 会检出中间点让你逐一验证。").
-					FontSize(12).TextColor(t.TextMuted)
-				field.Input(c, &m.bisectGood, field.InputProps{
-					Placeholder: "好提交（如 v1.0 或 abc1234）…", Size: theme.Middle,
-				}).Grow(1)
-				field.Input(c, &m.bisectBad, field.InputProps{
-					Placeholder: "坏提交（默认 HEAD）…", Size: theme.Middle,
-				}).Grow(1)
-				ui.Row(c).Gap(8).Justify(ui.End).Children(func() {
-					action.Button(c, "开始", action.ButtonProps{Variant: action.Primary, Size: theme.Middle}).
-						Disabled(m.bisectBusy || strings.TrimSpace(m.bisectGood) == "").
-						OnClick(func() {
-							good := strings.TrimSpace(m.bisectGood)
-							bad := strings.TrimSpace(m.bisectBad)
-							if bad == "" {
-								bad = "HEAD"
-							}
-							m.bisectOp(appCTX, a.updater(), func(ctx context.Context, r *git.Repo) (*git.RunResult, error) {
-								return r.BisectStart(ctx, good, bad)
-							})
-						})
-				})
-				return
-			}
-			// Active session.
-			if st.Done {
-				feedback.Alert(c, "已定位首个坏提交："+st.FirstBadOID,
-					feedback.AlertProps{Type: feedback.Success, Variant: feedback.Soft})
-			} else {
-				ui.Column(c).Gap(4).Children(func() {
-					ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
-						ui.Text(c, "当前候选").Bold()
-						display.Tag(c, shortOID(st.CurrentOID), display.TagProps{Variant: display.TagOutlined, Color: display.TagInfo})
-					})
-					ui.Text(c, st.CurrentSub).FontSize(12).SingleLine()
-					ui.Text(c, fmt.Sprintf("已标记 %d 步", st.Steps)).FontSize(11).TextColor(t.TextMuted)
-				})
-			}
-			ui.Row(c).Gap(8).Justify(ui.End).Children(func() {
-				if !st.Done {
-					action.Button(c, "好", action.ButtonProps{Variant: action.Default, Size: theme.Middle}).
-						Disabled(m.bisectBusy).OnClick(func() {
-						m.bisectOp(appCTX, a.updater(), func(ctx context.Context, r *git.Repo) (*git.RunResult, error) {
-							return r.BisectMark(ctx, true)
-						})
-					})
-					action.Button(c, "坏", action.ButtonProps{Variant: action.Default, Size: theme.Middle}).
-						Disabled(m.bisectBusy).OnClick(func() {
-						m.bisectOp(appCTX, a.updater(), func(ctx context.Context, r *git.Repo) (*git.RunResult, error) {
-							return r.BisectMark(ctx, false)
-						})
-					})
-					action.Button(c, "跳过", action.ButtonProps{Variant: action.Text, Size: theme.Middle}).
-						Disabled(m.bisectBusy).OnClick(func() {
-						m.bisectOp(appCTX, a.updater(), func(ctx context.Context, r *git.Repo) (*git.RunResult, error) {
-							return r.BisectSkip(ctx)
-						})
-					})
-				}
-				action.Button(c, "结束", action.ButtonProps{Variant: action.Text, Size: theme.Middle}).
-					Disabled(m.bisectBusy).OnClick(func() {
-					m.bisectOp(appCTX, a.updater(), func(ctx context.Context, r *git.Repo) (*git.RunResult, error) {
-						return r.BisectReset(ctx)
-					})
-				})
-			})
-		})
-	})
-}
-
-// lfsLocksOverlay lists the repo's LFS locks (IDEA: Git → LFS → Locks).
-func (a *app) lfsLocksOverlay(c *ui.Context, t *ui.Theme) {
-	m := &a.commit
-	feedback.Modal(c, &m.lfsLocksOpen, feedback.ModalProps{
-		Title:    "LFS Locks",
-		Width:    640,
-		NoFooter: true,
-	}, func() {
-		ui.Column(c).Gap(10).MinHeight(200).Children(func() {
-			ui.Row(c).FillWidth().Children(func() {
-				ui.Text(c, fmt.Sprintf("%d 个锁", len(m.lfsLocks))).Grow(1)
-				action.Button(c, "刷新", action.ButtonProps{Variant: action.Text, Size: theme.Small}).
-					OnClick(func() {
-						m.lfsLocksLoad = true
-						m.loadLFS(a.updater())
-					})
-			})
-			if len(m.lfsLocks) == 0 {
-				a.placeholder(c, t, "没有 LFS 锁。")
-				return
-			}
-			layout.ScrollArea(c, layout.ScrollAreaProps{}, func() {
-				ui.Column(c).FillWidth().Children(func() {
-					for i := range m.lfsLocks {
-						lk := &m.lfsLocks[i]
-						ui.Row(c).Key("lfs-"+lk.ID).FillWidth().Padding(6, 10).Gap(10).AlignItems(ui.Center).Children(func() {
-							ui.Column(c).Grow(1).Gap(1).Children(func() {
-								ui.Text(c, lk.Path).SingleLine()
-								ui.Text(c, lk.Owner.Name+" · "+lk.LockedAt).FontSize(11).TextColor(t.TextMuted)
-							})
-							action.Button(c, "解锁", action.ButtonProps{Variant: action.Text, Size: theme.Small}).
-								OnClick(func() {
-									a.lfsUnlock(lk.Path)
-								})
-						})
-					}
-				})
-			}).Grow(1)
-		})
-	})
-}
-
-// lfsUnlock releases one LFS lock then reloads the list.
-func (a *app) lfsUnlock(path string) {
-	m := &a.commit
-	repoPath := m.RepoPath
-	go func() {
-		repo := git.NewRepo(repoPath)
-		res, err := repo.LFSUnlock(context.Background(), path, false)
-		locks, _ := repo.LFSLocks(context.Background())
-		a.update(func() {
-			if err == nil && res != nil && res.ExitOK() {
-				m.lfsLocks = locks
-				a.notify("success", "已解锁 "+path)
-				return
-			}
-			msg := ""
-			if err != nil {
-				msg = err.Error()
-			} else if res != nil {
-				msg = res.OutputOfStderr()
-			}
-			a.notify("error", "解锁失败："+msg)
-		})
-	}()
-}
-
-// stashBranchDialog collects the branch name for `git stash branch`.
-func (a *app) stashBranchDialog(c *ui.Context, t *ui.Theme) {
-	if feedback.Modal(c, &a.stashBranchOpen, feedback.ModalProps{
-		Title: "从 " + a.stashBranchFrom + " 建分支", Width: 420, OkText: "创建",
-	}, func() {
-		ui.Column(c).Gap(8).Children(func() {
-			ui.Text(c, "在 stash 的基底提交上新建分支并应用 stash").FontSize(12).TextColor(t.TextMuted)
-			field.Input(c, &a.stashBranchName, field.InputProps{
-				Placeholder: "新分支名…", Size: theme.Middle,
-			}).Grow(1).OnSubmit(func() { a.confirmStashBranch() })
-		})
-	}) {
-		a.confirmStashBranch()
-	}
-}
-
-func (a *app) confirmStashBranch() bool {
-	name := strings.TrimSpace(a.stashBranchName)
-	if name == "" {
-		return false
-	}
-	stashName := a.stashBranchFrom
-	a.stashBranchOpen = false
-	a.shelf.op(a.commit.RepoPath, a.updater(), "正在建分支…", "已建分支",
-		func(r *git.Repo) error {
-			res, err := r.StashBranch(context.Background(), name, stashName)
-			if err != nil {
-				return err
-			}
-			if !res.ExitOK() {
-				return &git.GitError{Args: res.Args, Stderr: res.OutputOfStderr()}
-			}
-			return nil
-		}, func() {
-			a.stashBranchName = ""
-			a.commit.refresh(appCTX, a.updater())
-		})
-	return true
-}
-
-// compareOverlay is the branch/worktree compare modal. Single and
-// two-ref modes share one shape (IDEA "Compare with Current" / "Compare
-// with 'xxx'"): unique-commit lists on top when a BranchCompare is
-// loaded, the file diff list under them, diff on the right. Worktree
-// mode skips the commit lists — there's nothing to merge-base against.
-func (a *app) compareOverlay(c *ui.Context, t *ui.Theme) {
-	m := &a.compare
-	title := "比较 — " + m.ref
-	switch {
-	case m.worktreeMode:
-		title = "与工作区比较 — " + m.ref
-	case m.refB != "":
-		title = "比较 — " + m.ref + " ↔ " + m.refB
-	}
-	feedback.Modal(c, &m.open, feedback.ModalProps{
-		Title:    title,
-		Width:    1100,
-		NoFooter: true,
-	}, func() {
-		ui.Row(c).Fill().MinHeight(520).MaxHeight(640).Children(func() {
-			// Left pane: unique commits on top (bounded — a long list
-			// used to stretch the modal past the window), files below.
-			ui.Column(c).Width(340).Fill().Children(func() {
-				if m.cmp != nil {
-					ui.Column(c).FillWidth().MaxHeight(170).Children(func() {
-						layout.ScrollArea(c, layout.ScrollAreaProps{}, func() {
-							a.branchCompareSides(c, t)
-						})
-					})
-				}
-				switch {
-				case m.loading:
-					a.placeholder(c, t, "正在加载文件…")
-				case m.err != "":
-					feedback.Alert(c, m.err, feedback.AlertProps{Type: feedback.Error, Variant: feedback.Soft})
-				case len(m.files) == 0 && m.selected == "":
-					a.placeholder(c, t, "没有差异文件。")
-				case len(m.files) == 0:
-					// Single-file mode: show the file itself.
-					a.compareFileRow(c, t, git.CommitFile{Path: m.selected, Status: 'M'})
-				default:
-					ui.Text(c, "差异文件").FontSize(11).Bold().TextColor(t.TextMuted).
-						Padding(4, 0)
-					layout.ScrollArea(c, layout.ScrollAreaProps{}, func() {
-						ui.Column(c).FillWidth().Children(func() {
-							for i := range m.files {
-								a.compareFileRow(c, t, m.files[i])
-							}
-						})
-					}).Grow(1).MinHeight(120)
-				}
-			})
-			// Right: diff. MinWidth keeps the pane from collapsing into
-			// a sliver when the commit lists are long; MinHeight gives
-			// the Modal's unconstrained height a floor to grow into.
-			ui.Column(c).Grow(1).MinWidth(300).Fill().MinHeight(440).Padding(0, 0, 0, 12).Children(func() {
-				switch {
-				case m.selected == "":
-					a.placeholder(c, t, "选择文件查看差异。")
-				case m.diffLoad:
-					a.placeholder(c, t, "正在加载差异…")
-				case m.diffErr != "":
-					feedback.Alert(c, m.diffErr, feedback.AlertProps{Type: feedback.Error, Variant: feedback.Soft})
-				case m.diff == nil:
-					a.placeholder(c, t, "无差异。")
-				case m.diff.Binary:
-					a.placeholder(c, t, "二进制文件。")
-				case string(m.diff.Old) == string(m.diff.New):
-					// The file row appeared under a merge-base diff but
-					// both tips hold identical content — say so rather
-					// than paint an all-context diff that reads as blank.
-					a.placeholder(c, t, "两端内容相同。")
-				default:
-					a.cmpDiffView(c, t)
-				}
-			})
-		})
-	})
-}
-
-// branchCompareDialog collects the second ref for "与 'xxx' 比较…".
-func (a *app) branchCompareDialog(c *ui.Context, t *ui.Theme) {
-	if feedback.Modal(c, &a.branchCmpOpen, feedback.ModalProps{
-		Title: "与 '" + a.branchCmpFrom + "' 比较", Width: 420, OkText: "比较",
-	}, func() {
-		ui.Column(c).Gap(8).Children(func() {
-			ui.Text(c, "选择另一个分支/tag/commit 进行对比").FontSize(12).TextColor(t.TextMuted)
-			field.Input(c, &a.branchCmpInput, field.InputProps{
-				Placeholder: "分支/tag/commit…",
-				Size:        theme.Middle,
-			}).Grow(1).OnSubmit(func() { a.confirmBranchCompare() })
-		})
-	}) {
-		a.confirmBranchCompare()
-	}
-}
-
-func (a *app) confirmBranchCompare() bool {
-	other := strings.TrimSpace(a.branchCmpInput)
-	if other == "" {
-		return false
-	}
-	a.cmpDiffState = nil
-	a.compare.openForBranches(a.commit.RepoPath, a.branchCmpFrom, other, a.updater())
-	a.branchCmpInput = ""
-	a.branchCmpOpen = false
-	return true
-}
-
-// branchCompareSides renders the unique-commits lists (IDEA's
-// "commits in A not in B" panels). Two-ref mode labels them with both
-// refs; single mode labels the second side "当前分支" (HEAD).
-func (a *app) branchCompareSides(c *ui.Context, t *ui.Theme) {
-	m := &a.compare
-	if m.cmp == nil {
-		return
-	}
-	other := m.refB
-	if other == "" {
-		other = "当前分支"
-	}
-	// CompareBranches is always called with a=HEAD-equivalent side
-	// first: single mode CompareBranches(HEAD, ref) puts ref's unique
-	// commits in BOnly; two-ref openForBranches(a, b) puts a's in AOnly.
-	ours, theirs := m.cmp.AOnly, m.cmp.BOnly
-	if m.refB == "" {
-		ours, theirs = m.cmp.BOnly, m.cmp.AOnly
-	}
-	ui.Column(c).FillWidth().Gap(2).Children(func() {
-		ui.Text(c, "独有提交").FontSize(11).Bold().TextColor(t.TextMuted).Padding(4, 0)
-		a.cmpSide(c, t, m.ref+" 独有", ours)
-		a.cmpSide(c, t, other+" 独有", theirs)
-		if m.cmp.Unrelated {
-			feedback.Alert(c, "两个分支没有共同祖先", feedback.AlertProps{Type: feedback.Warning, Variant: feedback.Soft})
-		}
-	})
-}
-
-// cmpSide lists one side's unique commits (compact, newest first).
-func (a *app) cmpSide(c *ui.Context, t *ui.Theme, label string, list []git.Commit) {
-	ui.Column(c).FillWidth().Gap(1).Children(func() {
-		ui.Row(c).Gap(6).AlignItems(ui.Center).Padding(3, 0).Children(func() {
-			ui.Text(c, label).FontSize(11).Bold()
-			display.Tag(c, fmt.Sprintf("%d", len(list)), display.TagProps{
-				Variant: display.TagBorderless, Color: display.TagInfo,
-			})
-		})
-		if len(list) == 0 {
-			ui.Text(c, "（无独有提交）").FontSize(11).TextColor(t.TextMuted).Padding(0, 0, 6, 0)
-			return
-		}
-		show := list
-		truncated := 0
-		if len(show) > 6 {
-			truncated = len(show) - 6
-			show = show[:6]
-		}
-		for i := range show {
-			cm := &show[i]
-			ui.Row(c).Key("cmps-"+cm.OID).FillWidth().Gap(6).Padding(2, 0).Children(func() {
-				ui.Text(c, cm.ShortOID).FontSize(11).TextColor(t.TextMuted).Width(58).SingleLine()
-				ui.Text(c, cm.Subject).FontSize(11).SingleLine().Grow(1)
-			})
-		}
-		if truncated > 0 {
-			ui.Text(c, fmt.Sprintf("…还有 %d 条", truncated)).FontSize(11).TextColor(t.TextMuted).
-				Padding(0, 0, 4, 0)
-		}
-	})
-}
-
-// compareFileRow: one changed file in the compare list.
-func (a *app) compareFileRow(c *ui.Context, t *ui.Theme, f git.CommitFile) {
-	m := &a.compare
-	sel := m.selected == f.Path
-	label := f.Path
-	if f.OrigPath != "" {
-		label = f.OrigPath + " → " + f.Path
-	}
-	ui.Row(c).Key("cmp-"+f.Path).FillWidth().Padding(6, 14).Gap(8).AlignItems(ui.Center).
-		Background(rowBg(t, sel)).
-		OnClick(func() {
-			a.cmpDiffState = nil
-			m.selectFile(a.commit.RepoPath, f.Path, a.updater())
-		}).
-		Children(func() {
-			display.Tag(c, statusGlyph(f.StatusKind()), display.TagProps{
-				Variant: display.TagBorderless,
-				Color:   statusTagColor(f.StatusKind()),
-			})
-			ui.Text(c, label).FontSize(12).SingleLine()
-		})
-}
-
-// cmpDiffView renders the compare diff with its own state.
-func (a *app) cmpDiffView(c *ui.Context, t *ui.Theme) {
-	d := a.compare.diff
-	if a.cmpDiffState == nil {
-		a.cmpDiffState = &editor.DiffState{
-			Old: editor.NewBuffer(string(d.Old)),
-			New: editor.NewBuffer(string(d.New)),
-		}
-	}
-	a.cmpDiffState.Layout = editor.DiffUnified
-	// Height (not Grow): inside the Modal's own scroll a Grow child is
-	// unconstrained — the diff must own the pane's fixed height so its
-	// top stays pinned while the file list scrolls on the left.
-	editor.DiffView(c, a.cmpDiffState).Fill().MinHeight(440)
-}
-
-// amendDialog edits the HEAD commit's message (IDEA: "编辑提交消息…").
-func (a *app) amendDialog(c *ui.Context, t *ui.Theme) {
-	confirmed := feedback.Modal(c, &a.amendOpen, feedback.ModalProps{
-		Title:  "编辑提交消息",
-		Width:  480,
-		OkText: "确定",
-	}, func() {
-		ui.Column(c).Gap(8).Children(func() {
-			ui.Text(c, "修改最近一条提交的提交信息").FontSize(12).TextColor(t.TextMuted)
-			field.TextArea(c, &a.amendInput, field.TextAreaProps{
-				Placeholder: "提交信息…",
-				MinRows:     3,
-				MaxRows:     8,
-			}).Grow(1)
-		})
-	})
-	if confirmed && strings.TrimSpace(a.amendInput) != "" {
-		msg := a.amendInput
-		a.amendOpen = false
-		a.commit.runOp(appCTX, a.updater(), "正在修改…", "已修改提交信息",
-			func(ctx context.Context, r *git.Repo) (*git.RunResult, error) {
-				return r.AmendMessage(ctx, msg)
-			}, func() {
-				a.history.lastLoadedRepo = "" // subject changed — reload log
-			})
-	}
-}
-
-// pushUpToDialog confirms "推送此前所有提交…": pushes the current
-// branch's commits up to (and including) a chosen commit.
-func (a *app) pushUpToDialog(c *ui.Context, t *ui.Theme) {
-	confirmed := feedback.Modal(c, &a.pushUpToOpen, feedback.ModalProps{
-		Title:  "推送此前所有提交",
-		Width:  440,
-		OkText: "推送",
-	}, func() {
-		ui.Column(c).Gap(8).Children(func() {
-			ui.Text(c, "把当前分支在 "+a.pushUpToShort+" 及之前的所有提交推送到远端").
-				FontSize(12).TextColor(t.TextMuted)
-		})
-	})
-	if confirmed {
-		oid := a.pushUpToOID
-		a.pushUpToOpen = false
-		a.commit.pushUpTo(appCTX, a.updater(), oid)
-	}
-}
-
-// renameDialog edits a local branch's name (IDEA: branch → Rename).
-func (a *app) renameDialog(c *ui.Context, t *ui.Theme) {
-	m := &a.branches
-	confirmed := feedback.Modal(c, &m.renameOpen, feedback.ModalProps{
-		Title:  "重命名分支 — " + m.renameOld,
-		Width:  420,
-		OkText: "重命名",
-	}, func() {
-		ui.Column(c).Gap(8).Children(func() {
-			field.Input(c, &m.renameNew, field.InputProps{
-				Placeholder: "新的分支名…",
-				Size:        theme.Middle,
-			}).Grow(1).OnSubmit(func() {
-				a.doRenameBranch()
-			})
-		})
-	})
-	if confirmed {
-		a.doRenameBranch()
-	}
-}
-
-// doRenameBranch runs git branch -m.
-func (a *app) doRenameBranch() {
-	m := &a.branches
-	newName := strings.TrimSpace(m.renameNew)
-	if newName == "" || newName == m.renameOld {
-		return
-	}
-	old := m.renameOld
-	m.op(a.commit.RepoPath, a.updater(), "正在重命名…", "已重命名",
-		func(r *git.Repo) (*git.RunResult, error) {
-			return r.RenameBranch(context.Background(), old, newName)
-		},
-		func() {
-			m.renameOpen = false
-			a.commit.refresh(appCTX, a.updater()) // current branch may have been renamed
-		})
-}
-
-// remoteDialog is IDEA's "Git Remotes" manager: list + add/edit/delete.
-func (a *app) remoteDialog(c *ui.Context, t *ui.Theme) {
-	m := &a.branches
-	feedback.Modal(c, &m.remoteOpen, feedback.ModalProps{
-		Title:    "Git 远程仓库",
-		Width:    620,
-		NoFooter: true,
-	}, func() {
-		ui.Column(c).Gap(10).Children(func() {
-			if m.remoteErr != "" {
-				feedback.Alert(c, m.remoteErr, feedback.AlertProps{Type: feedback.Error, Variant: feedback.Soft})
-			}
-			ui.Column(c).Border(1, theme.TokensOf(c).BorderSecondary).Radius(6).Children(func() {
-				layout.ScrollArea(c, layout.ScrollAreaProps{}, func() {
-					ui.Column(c).FillWidth().Children(func() {
-						if len(m.remoteList) == 0 {
-							ui.Row(c).Padding(10, 14).Children(func() {
-								ui.Text(c, "没有配置远程仓库。").FontSize(12).TextColor(t.TextMuted)
-							})
-						}
-						for i := range m.remoteList {
-							a.remoteRow(c, t, &m.remoteList[i])
-						}
-					})
-				}).Grow(1).MinHeight(120).MaxHeight(240)
-			})
-			// Add / edit form.
-			ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
-				field.Input(c, &m.remoteName, field.InputProps{
-					Placeholder: "名称（如 origin）", Size: theme.Small,
-				}).Width(140).Disabled(m.remoteEdit != "")
-				field.Input(c, &m.remoteURL, field.InputProps{
-					Placeholder: "URL…", Size: theme.Small,
-				}).Grow(1)
-				label := "添加"
-				if m.remoteEdit != "" {
-					label = "保存"
-				}
-				action.Button(c, label, action.ButtonProps{Variant: action.Primary, Size: theme.Small}).
-					OnClick(func() { a.saveRemote() })
-				if m.remoteEdit != "" {
-					action.Button(c, "取消", action.ButtonProps{Variant: action.Text, Size: theme.Small}).
-						OnClick(func() {
-							m.remoteEdit = ""
-							m.remoteName, m.remoteURL = "", ""
-						})
-				}
-			})
-			ui.Row(c).Justify(ui.End).Children(func() {
-				action.Button(c, "关闭", action.ButtonProps{Variant: action.Default, Size: theme.Small}).
-					OnClick(func() { m.remoteOpen = false })
-			})
-		})
-	})
-}
-
-// remoteRow: one remote + edit/delete actions.
-func (a *app) remoteRow(c *ui.Context, t *ui.Theme, r *git.Remote) {
-	m := &a.branches
-	ui.Row(c).FillWidth().Padding(6, 14).Gap(8).AlignItems(ui.Center).Children(func() {
-		ui.Column(c).Grow(1).Gap(1).Children(func() {
-			ui.Text(c, r.Name).Bold()
-			ui.Text(c, r.FetchURL).FontSize(11).TextColor(t.TextMuted).SingleLine()
-		})
-		action.Button(c, "编辑", action.ButtonProps{Variant: action.Text, Size: theme.Small}).
-			OnClick(func() {
-				m.remoteEdit = r.Name
-				m.remoteName = r.Name
-				m.remoteURL = r.FetchURL
-			})
-		action.Button(c, "删除", action.ButtonProps{Variant: action.Text, Size: theme.Small}).
-			OnClick(func() {
-				name := r.Name
-				m.remoteOp(a.commit.RepoPath, a.updater(),
-					func(rp *git.Repo) (*git.RunResult, error) {
-						return rp.RemoveRemote(context.Background(), name)
-					})
-			})
-	})
-}
-
-// saveRemote adds or updates the form's remote.
-func (a *app) saveRemote() {
-	m := &a.branches
-	url := strings.TrimSpace(m.remoteURL)
-	if url == "" {
-		m.remoteErr = "请输入 URL"
-		return
-	}
-	if m.remoteEdit != "" {
-		name := m.remoteEdit
-		m.remoteOp(a.commit.RepoPath, a.updater(),
-			func(rp *git.Repo) (*git.RunResult, error) {
-				return rp.SetRemoteURL(context.Background(), name, url)
-			})
-	} else {
-		name := strings.TrimSpace(m.remoteName)
-		if name == "" {
-			m.remoteErr = "请输入名称"
-			return
-		}
-		m.remoteOp(a.commit.RepoPath, a.updater(),
-			func(rp *git.Repo) (*git.RunResult, error) {
-				return rp.AddRemote(context.Background(), name, url)
-			})
-	}
-	m.remoteEdit = ""
-	m.remoteName, m.remoteURL = "", ""
-}
-
-// --- 冲突解决 ---------------------------------------------------------
-
-// conflictOverlay renders the three-way resolver modal.
-func (a *app) conflictOverlay(c *ui.Context, t *ui.Theme) {
-	m := &a.conflict
-	feedback.Modal(c, &m.open, feedback.ModalProps{
-		Title:    "解决冲突 — " + m.path,
-		Width:    960,
-		NoFooter: true,
-	}, func() {
-		switch {
-		case m.loading:
-			a.placeholder(c, t, "正在加载冲突内容…")
-		case m.err != "":
-			feedback.Alert(c, m.err, feedback.AlertProps{Type: feedback.Error, Variant: feedback.Soft})
-		case m.sides == nil:
-			a.placeholder(c, t, "无冲突内容。")
-		default:
-			a.conflictResolver(c, t)
-		}
-	})
-}
-
-// conflictResolver draws base/ours/theirs + merge editor + actions.
-func (a *app) conflictResolver(c *ui.Context, t *ui.Theme) {
-	m := &a.conflict
-	ui.Column(c).Gap(10).Children(func() {
-		// Three sides side-by-side (read-only diffs against base).
-		ui.Row(c).Gap(8).Children(func() {
-			a.conflictSide(c, t, "当前分支（ours）", m.sides.Base, m.sides.Ours)
-			a.conflictSide(c, t, "基础版本（base）", m.sides.Base, m.sides.Base)
-			a.conflictSide(c, t, "合并进来（theirs）", m.sides.Base, m.sides.Their)
-		})
-		// Merge editor.
-		ui.Column(c).Gap(4).Children(func() {
-			ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
-				ui.Text(c, "合并结果").Bold()
-				ui.Text(c, "").Grow(1)
-				action.Button(c, "采用当前分支", action.ButtonProps{Variant: action.Text, Size: theme.Small}).
-					OnClick(func() { m.merged = string(m.sides.Ours) })
-				action.Button(c, "采用对方", action.ButtonProps{Variant: action.Text, Size: theme.Small}).
-					OnClick(func() { m.merged = string(m.sides.Their) })
-			})
-			field.TextArea(c, &m.merged, field.TextAreaProps{
-				MinRows: 8,
-				MaxRows: 16,
-			}).Grow(1)
-		})
-		// Actions.
-		ui.Row(c).Gap(8).Justify(ui.End).Children(func() {
-			action.Button(c, "采用当前分支并解决", action.ButtonProps{Variant: action.Default, Size: theme.Middle}).
-				Disabled(m.busy).OnClick(func() {
-				m.resolve(a.commit.RepoPath, git.ResolveOurs, a.updater(), func() {
-					a.commit.refresh(appCTX, a.updater())
-				})
-			})
-			action.Button(c, "采用对方并解决", action.ButtonProps{Variant: action.Default, Size: theme.Middle}).
-				Disabled(m.busy).OnClick(func() {
-				m.resolve(a.commit.RepoPath, git.ResolveTheirs, a.updater(), func() {
-					a.commit.refresh(appCTX, a.updater())
-				})
-			})
-			action.Button(c, "保存合并结果", action.ButtonProps{Variant: action.Primary, Size: theme.Middle}).
-				Disabled(m.busy).OnClick(func() {
-				m.resolve(a.commit.RepoPath, git.ResolveMerge, a.updater(), func() {
-					a.commit.refresh(appCTX, a.updater())
-				})
-			})
-		})
-	})
-}
-
-// conflictSide renders one read-only diff column.
-func (a *app) conflictSide(c *ui.Context, t *ui.Theme, title string, base, side []byte) {
-	tk := theme.TokensOf(c)
-	ui.Column(c).Grow(1).Basis(0).Gap(4).Children(func() {
-		ui.Text(c, title).FontSize(11).Bold().TextColor(t.TextMuted)
-		ui.Column(c).Border(1, tk.BorderSecondary).Radius(6).Padding(6).MaxHeight(180).Children(func() {
-			layout.ScrollArea(c, layout.ScrollAreaProps{}, func() {
-				ui.Text(c, string(side)).FontSize(11).SingleLine()
-			}).Grow(1)
-		})
-	})
-}
-
-// --- Resolve Conflicts 列表（IDEA 的 Git → Resolve Conflicts…） ----------
-
-// conflictsOverlay renders the all-files conflict list: per-row
-// "ours / theirs / merge…" plus a batch action row, mirroring IDEA's
-// dedicated dialog.
-func (a *app) conflictsOverlay(c *ui.Context, t *ui.Theme) {
-	m := &a.conflicts
-	feedback.Modal(c, &m.open, feedback.ModalProps{
-		Title:    "解决冲突",
-		Width:    720,
-		NoFooter: true,
-	}, func() {
-		ui.Column(c).Gap(10).MinHeight(320).Children(func() {
-			switch {
-			case m.loading:
-				a.placeholder(c, t, "正在加载冲突文件…")
-			case m.err != "":
-				feedback.Alert(c, m.err, feedback.AlertProps{Type: feedback.Error, Variant: feedback.Soft})
-			case len(m.entries) == 0:
-				a.placeholder(c, t, "没有冲突 — 所有文件都已解决。")
-			default:
-				// Summary + batch actions (IDEA's toolbar).
-				ui.Row(c).FillWidth().Gap(8).AlignItems(ui.Center).Children(func() {
-					ui.Text(c, fmt.Sprintf("共 %d 个冲突文件", len(m.entries))).Grow(1)
-					action.Button(c, "全部采用当前分支", action.ButtonProps{Variant: action.Default, Size: theme.Small}).
-						Disabled(m.busy).OnClick(func() {
-						m.resolveAll(a.commit.RepoPath, git.ResolveOurs, a.updater(), func() {
-							a.commit.refresh(appCTX, a.updater())
-						})
-					})
-					action.Button(c, "全部采用对方", action.ButtonProps{Variant: action.Default, Size: theme.Small}).
-						Disabled(m.busy).OnClick(func() {
-						m.resolveAll(a.commit.RepoPath, git.ResolveTheirs, a.updater(), func() {
-							a.commit.refresh(appCTX, a.updater())
-						})
-					})
-				})
-				// File list.
-				layout.ScrollArea(c, layout.ScrollAreaProps{}, func() {
-					ui.Column(c).FillWidth().Children(func() {
-						for i := range m.entries {
-							a.conflictEntryRow(c, t, &m.entries[i])
-						}
-					})
-				}).Grow(1)
-				// Footer.
-				ui.Row(c).Gap(8).Justify(ui.End).Children(func() {
-					action.Button(c, "关闭", action.ButtonProps{Variant: action.Default, Size: theme.Middle}).
-						OnClick(m.close)
-				})
-			}
-		})
-	})
-}
-
-// conflictEntryRow: one unmerged path + its actions.
-func (a *app) conflictEntryRow(c *ui.Context, t *ui.Theme, e *git.ConflictEntry) {
-	repoPath := a.commit.RepoPath
-	ui.Row(c).Key("cf-"+e.Path).FillWidth().Padding(6, 10).Gap(10).AlignItems(ui.Center).
-		Children(func() {
-			display.Tag(c, e.Kind, display.TagProps{
-				Variant: display.TagBorderless,
-				Color:   display.TagWarning,
-			})
-			ui.Column(c).Grow(1).Gap(1).Children(func() {
-				ui.Text(c, e.Path).SingleLine()
-				ui.Text(c, fmt.Sprintf("%d 处冲突标记", e.Hunks)).FontSize(11).TextColor(t.TextMuted)
-			})
-			action.Button(c, "采用当前", action.ButtonProps{Variant: action.Text, Size: theme.Small}).
-				OnClick(func() {
-					a.conflicts.resolveOne(repoPath, e.Path, git.ResolveOurs, a.updater(), func() {
-						a.commit.refresh(appCTX, a.updater())
-					})
-				})
-			action.Button(c, "采用对方", action.ButtonProps{Variant: action.Text, Size: theme.Small}).
-				OnClick(func() {
-					a.conflicts.resolveOne(repoPath, e.Path, git.ResolveTheirs, a.updater(), func() {
-						a.commit.refresh(appCTX, a.updater())
-					})
-				})
-			action.Button(c, "合并…", action.ButtonProps{Variant: action.Default, Size: theme.Small}).
-				OnClick(func() {
-					a.conflict.openFor(repoPath, e.Path, a.updater())
-				})
-		})
-}
-
-// --- Reflog -----------------------------------------------------------
-
-// reflogOverlay renders the Reflog panel: HEAD history with actions.
-func (a *app) reflogOverlay(c *ui.Context, t *ui.Theme) {
-	m := &a.reflog
-	feedback.Modal(c, &m.open, feedback.ModalProps{
-		Title:    "Reflog — HEAD 操作历史",
-		Width:    780,
-		NoFooter: true,
-	}, func() {
-		ui.Column(c).Gap(8).MinHeight(400).Children(func() {
-			switch {
-			case m.loading:
-				a.placeholder(c, t, "正在加载 Reflog…")
-			case m.err != "":
-				feedback.Alert(c, m.err, feedback.AlertProps{Type: feedback.Error, Variant: feedback.Soft})
-			case len(m.entries) == 0:
-				a.placeholder(c, t, "没有 Reflog 记录。")
-			default:
-				layout.ScrollArea(c, layout.ScrollAreaProps{}, func() {
-					ui.Column(c).FillWidth().Children(func() {
-						for i := range m.entries {
-							a.reflogRow(c, t, &m.entries[i])
-						}
-					})
-				}).Grow(1)
-			}
-		})
-	})
-}
-
-// reflogRow: index + action + message + target oid + time.
-func (a *app) reflogRow(c *ui.Context, t *ui.Theme, e *git.ReflogEntry) {
-	repoPath := a.commit.RepoPath
-	ui.Row(c).Key(fmt.Sprintf("rl-%d-%s", e.Index, e.OID)).FillWidth().Padding(6, 10).Gap(10).AlignItems(ui.Center).
-		Children(func() {
-			ui.Text(c, fmt.Sprintf("HEAD@{%d}", e.Index)).FontSize(11).TextColor(t.TextMuted).Width(80).SingleLine()
-			display.Tag(c, e.Action, display.TagProps{Variant: display.TagBorderless, Color: display.TagInfo})
-			ui.Column(c).Grow(1).Gap(1).Children(func() {
-				ui.Text(c, e.Message).SingleLine()
-				ui.Row(c).Gap(6).Children(func() {
-					ui.Text(c, e.Short).FontSize(11).TextColor(t.TextMuted)
-					ui.Text(c, e.Who).FontSize(11).TextColor(t.TextMuted)
-					ui.Text(c, relTime(e.When)).FontSize(11).TextColor(t.TextMuted)
-				})
-			})
-			// Jump to that commit in Log — also switch to the 历史 tab so
-			// the user lands on it (IDEA: Reflog → Show in Log).
-			action.Button(c, "查看", action.ButtonProps{Variant: action.Text, Size: theme.Small}).
-				OnClick(func() {
-					a.reflog.close()
-					a.tab = 1
-					a.history.ensureLoaded(repoPath, a.updater())
-					a.history.selectCommit(repoPath, e.OID, a.updater())
-					a.history.scrollToCommit(e.OID, a.commit.RepoPath, a.updater())
-				})
-		})
-}
-
-// --- 分支/变基弹窗 -----------------------------------------------------
-
-// branchDialog collects a branch name or rebase target.
-func (a *app) branchDialog(c *ui.Context, t *ui.Theme) {
-	title := "新建分支"
-	okText := "创建"
-	hint := "从 " + shortOID(a.newBranchFrom) + " 创建分支"
-	switch a.branchDialogKind {
-	case 1:
-		title = "变基到目标"
-		okText = "变基"
-		hint = "目标分支或提交"
-	case 2:
-		hint = "创建并切换到新分支"
-	}
-	if feedback.Modal(c, &a.branchDialogOpen, feedback.ModalProps{
-		Title: title, Width: 420, OkText: okText,
-	}, func() {
-		ui.Column(c).Gap(8).Children(func() {
-			ui.Text(c, hint).FontSize(12).TextColor(t.TextMuted)
-			field.Input(c, &a.branchInput, field.InputProps{
-				Placeholder: "分支名…",
-				Size:        theme.Middle,
-			}).Grow(1).OnSubmit(func() { a.confirmBranchDialog() })
-		})
-	}) {
-		a.confirmBranchDialog()
-	}
-}
-
-// confirmBranchDialog runs the dialog's action.
-func (a *app) confirmBranchDialog() bool {
-	name := strings.TrimSpace(a.branchInput)
-	if name == "" {
-		return false
-	}
-	switch a.branchDialogKind {
-	case 1: // rebase
-		a.commit.rebase(appCTX, a.updater(), name)
-	case 2: // create + checkout (IDEA: New Branch in the branches popup)
-		a.branches.newName = name
-		a.createBranch()
-	default: // new branch from commit
-		from := a.newBranchFrom
-		a.commit.runOp(appCTX, a.updater(), "正在创建分支…", "已创建",
-			func(ctx context.Context, r *git.Repo) (*git.RunResult, error) {
-				return r.RunOK(ctx, "branch", name, from)
-			}, func() {
-				a.branches.lastLoaded = "" // branch list reloads
-			})
-	}
-	a.branchInput = ""
-	a.branchDialogOpen = false
-	return true
-}
-
-// --- 文件历史/溯源 ---------------------------------------------------
-
-// fileHistOverlay renders the file-history dialog: sub-tabs for the
-// commit trail and the blame view.
-func (a *app) fileHistOverlay(c *ui.Context, t *ui.Theme) {
-	m := &a.fileHist
-	feedback.Modal(c, &m.open, feedback.ModalProps{
-		Title:    "文件历史 — " + m.path,
-		Width:    900,
-		NoFooter: true,
-	}, func() {
-		ui.Column(c).Gap(8).MinHeight(480).Children(func() {
-			action.Segmented(c, &m.mode, []string{"历史", "溯源"}, action.SegmentedProps{Size: theme.Small})
-			if m.mode == 1 {
-				a.blameView(c, t)
-				return
-			}
-			a.fileHistListView(c, t)
-		})
-	})
-}
-
-// fileHistListView: commits touching the file + diff for the pick.
-func (a *app) fileHistListView(c *ui.Context, t *ui.Theme) {
-	m := &a.fileHist
-	ui.Row(c).Fill().MinHeight(440).Children(func() {
-		// Left: commit list.
-		ui.Column(c).Width(320).Fill().Gap(0).Children(func() {
-			switch {
-			case m.loading:
-				a.placeholder(c, t, "正在加载历史…")
-			case m.err != "":
-				feedback.Alert(c, m.err, feedback.AlertProps{Type: feedback.Error, Variant: feedback.Soft})
-			case len(m.commits) == 0:
-				a.placeholder(c, t, "无历史记录。")
-			default:
-				layout.ScrollArea(c, layout.ScrollAreaProps{}, func() {
-					ui.Column(c).FillWidth().Children(func() {
-						for i := range m.commits {
-							a.fhCommitRow(c, t, &m.commits[i])
-						}
-					})
-				}).Grow(1)
-			}
-		})
-		// Right: diff of the file at that commit.
-		ui.Column(c).Grow(1).Fill().Padding(0, 0, 0, 12).Children(func() {
-			switch {
-			case m.diffLoading:
-				a.placeholder(c, t, "正在加载差异…")
-			case m.diffErr != "":
-				feedback.Alert(c, m.diffErr, feedback.AlertProps{Type: feedback.Error, Variant: feedback.Soft})
-			case m.diff == nil:
-				a.placeholder(c, t, "选择提交查看变更。")
-			case m.diff.Binary:
-				a.placeholder(c, t, "二进制文件。")
-			default:
-				a.fhDiffView(c, t)
-			}
-		})
-	})
-}
-
-// fhCommitRow: one commit in the file's trail.
-func (a *app) fhCommitRow(c *ui.Context, t *ui.Theme, cm *git.Commit) {
-	sel := a.fileHist.selectedID == cm.OID
-	repoPath := a.commit.RepoPath
-	oid := cm.OID
-	ui.Row(c).Key("fh-"+oid).FillWidth().Padding(6, 10).Gap(6).AlignItems(ui.Center).
-		Background(rowBg(t, sel)).
-		OnClick(func() {
-			a.fhDiffState = nil
-			a.fileHist.selectCommit(repoPath, oid, a.updater())
-		}).
-		Children(func() {
-			ui.Column(c).Grow(1).Gap(1).Children(func() {
-				ui.Text(c, cm.Subject).SingleLine().Grow(1)
-				ui.Row(c).Gap(6).Children(func() {
-					ui.Text(c, cm.ShortOID).FontSize(11).TextColor(t.TextMuted)
-					ui.Text(c, cm.Author).FontSize(11).TextColor(t.TextMuted)
-					ui.Text(c, relTime(cm.When)).FontSize(11).TextColor(t.TextMuted)
-				})
-			})
-		})
-}
-
-// fhDiffState is a separate DiffState for the overlay (so it doesn't
-// fight the main pane's).
-// fhDiffView renders the overlay's diff with its own state.
-func (a *app) fhDiffView(c *ui.Context, t *ui.Theme) {
-	d := a.fileHist.diff
-	if a.fhDiffState == nil {
-		a.fhDiffState = &editor.DiffState{
-			Old: editor.NewBuffer(string(d.Old)),
-			New: editor.NewBuffer(string(d.New)),
-		}
-	}
-	a.fhDiffState.Layout = editor.DiffUnified
-	editor.DiffView(c, a.fhDiffState).Grow(1).FillWidth().MinHeight(400)
-}
-
-// blameView renders the line-by-line attribution.
-func (a *app) blameView(c *ui.Context, t *ui.Theme) {
-	m := &a.fileHist
-	switch {
-	case m.blameLoading:
-		a.placeholder(c, t, "正在加载溯源…")
-	case m.blameErr != "":
-		feedback.Alert(c, m.blameErr, feedback.AlertProps{Type: feedback.Error, Variant: feedback.Soft})
-	case len(m.blame) == 0:
-		a.placeholder(c, t, "无溯源信息。")
-	default:
-		layout.ScrollArea(c, layout.ScrollAreaProps{}, func() {
-			ui.Column(c).FillWidth().Children(func() {
-				for i := range m.blame {
-					a.blameRow(c, t, &m.blame[i])
-				}
-			})
-		}).Grow(1)
-	}
-}
-
-// blameRow: hash + author + line number + content. The gutter clicks
-// through to that commit in the Log tab (IDEA: blame gutter → Show
-// commit in Log).
-func (a *app) blameRow(c *ui.Context, t *ui.Theme, bl *git.BlameLine) {
-	ui.Row(c).Key(fmt.Sprintf("bl-%d", bl.LineNo)).FillWidth().Gap(0).AlignItems(ui.Start).
-		Children(func() {
-			// Gutter: hash + author, fixed-width, colored by commit.
-			ui.Row(c).Width(180).Gap(6).Padding(2, 8).AlignItems(ui.Center).
-				Background(blameColor(t, bl.OID)).
-				Children(func() {
-					ui.Text(c, bl.ShortOID).FontSize(10).TextColor(t.Accent).SingleLine().
-						OnClick(func() {
-							a.fileHist.close()
-							a.history.selectCommit(a.commit.RepoPath, bl.OID, a.updater())
-						})
-					ui.Text(c, bl.Author).FontSize(10).TextColor(t.Text).SingleLine().Grow(1)
-				})
-			ui.Row(c).Width(48).Justify(ui.End).Padding(2, 8).Children(func() {
-				ui.Text(c, fmt.Sprintf("%d", bl.LineNo)).FontSize(11).TextColor(t.TextMuted)
-			})
-			ui.Row(c).Grow(1).Padding(2, 8).Children(func() {
-				ui.Text(c, bl.Text).FontSize(12).SingleLine()
-			})
-		})
-}
-
-// blameColor picks a gutter tint per commit (cycles a small palette so
-// adjacent commits get different hues).
-func blameColor(t *ui.Theme, oid string) ui.Color {
-	if oid == "" {
-		return ui.Transparent
-	}
-	var h uint32
-	for i := 0; i < len(oid) && i < 8; i++ {
-		h = h*31 + uint32(oid[i])
-	}
-	// Tints from the theme's status colors at low alpha so blame rows
-	// read as grouped without competing with the text.
-	palette := []ui.Color{
-		t.Selection,
-		t.Accent.Alpha(0.08),
-		t.Success.Alpha(0.08),
-		t.Warning.Alpha(0.08),
-	}
-	return palette[h%uint32(len(palette))]
-}
-
-// shortOID abbreviates a full hash for display.
-func shortOID(oid string) string {
-	if len(oid) > 7 {
-		return oid[:7]
-	}
-	return oid
-}
-
-// relTime formats a commit time like IDEA's log ("5 分钟前", "昨天").
-func relTime(t time.Time) string {
-	if t.IsZero() {
-		return ""
-	}
-	d := time.Since(t)
-	switch {
-	case d < time.Minute:
-		return "刚刚"
-	case d < time.Hour:
-		return fmt.Sprintf("%d 分钟前", int(d.Minutes()))
-	case d < 24*time.Hour:
-		return fmt.Sprintf("%d 小时前", int(d.Hours()))
-	case d < 7*24*time.Hour:
-		return fmt.Sprintf("%d 天前", int(d.Hours()/24))
-	case d < 365*24*time.Hour:
-		return t.Format("1月2日")
-	}
-	return t.Format("2006-01-02")
-}
-
-// diffSource is the pane's data supplier: the commit workspace and the
-// history tab both render through the same diffView.
-type diffSource struct {
-	selection string
-	loading   bool
-	err       string
-	diff      *git.DiffInfo
-	emptyText string
-	// partial shows the hunk-include bar (commit workspace only).
-	partial bool
-}
-
-// diffPane: mode toggle + diff or placeholder.
-func (a *app) diffPane(c *ui.Context, t *ui.Theme) {
-	m := &a.commit
-	a.renderDiffPane(c, t, diffSource{
-		selection: m.selectedFile,
-		loading:   m.diffLoading,
-		err:       m.diffErr,
-		diff:      m.diff,
-		emptyText: "选择文件查看变更。",
-		partial:   true,
-	})
-}
-
-// renderDiffPane draws the toggle + whatever the source resolves to.
-func (a *app) renderDiffPane(c *ui.Context, t *ui.Theme, s diffSource) {
-	tk := theme.TokensOf(c)
-	ui.Column(c).Fill().Gap(0).Background(tk.BgContainer).Children(func() {
-		ui.Row(c).Padding(8, 12).Gap(10).AlignItems(ui.Center).Children(func() {
-			action.Segmented(c, &a.diffMode, []string{"并排", "统一"}, action.SegmentedProps{Size: theme.Small})
-			// Flexible spacer pushes the labels to the far edge.
-			ui.Text(c, "").Grow(1)
-			if s.diff != nil {
-				ui.Text(c, s.diff.OldLabel+"  →  "+s.diff.NewLabel).TextColor(t.TextMuted)
-			}
-		})
-		// Hunk checkboxes for partial commit — only on the commit tab's
-		// worktree diff, where ticking a chunk means "put this in the
-		// commit" (IDEA's per-chunk include).
-		if s.partial && len(a.commit.hunks) > 1 {
-			a.hunkBarView(c, t)
-		}
-		switch {
-		case s.selection == "":
-			a.placeholder(c, t, s.emptyText)
-		case s.loading:
-			a.placeholder(c, t, "正在加载差异…")
-		case s.err != "":
-			a.placeholder(c, t, "差异加载失败："+s.err)
-		case s.diff == nil:
-			a.placeholder(c, t, "无差异可显示。")
-		case s.diff.Binary:
-			a.placeholder(c, t, "二进制文件 — 不显示差异。")
-		default:
-			a.diffView(c, t, s.diff)
-		}
-	})
-}
-
-// diffView builds or reuses the DiffState for the current selection.
-func (a *app) diffView(c *ui.Context, t *ui.Theme, d *git.DiffInfo) {
-	if a.diffState == nil {
-		old, new := "", ""
-		if d != nil {
-			old, new = string(d.Old), string(d.New)
-		}
-		a.diffState = &editor.DiffState{
-			Old: editor.NewBuffer(old),
-			New: editor.NewBuffer(new),
-		}
-	}
-	if a.diffMode == 1 {
-		a.diffState.Layout = editor.DiffUnified
-	} else {
-		a.diffState.Layout = editor.DiffSplit
-	}
-	a.diffState.SplitPercent = a.diffSplit
-	editor.DiffView(c, a.diffState).Grow(1).FillWidth()
-	a.diffSplit = a.diffState.SplitPercent
-}
-
-// hunkBarView is the partial-commit strip: one checkbox per changed
-// region of the selected file, like IDEA's per-chunk tick boxes.
-func (a *app) hunkBarView(c *ui.Context, t *ui.Theme) {
-	m := &a.commit
-	tk := theme.TokensOf(c)
-	ui.Column(c).FillWidth().Padding(4, 12).Gap(2).Background(tk.BgLayout).Children(func() {
-		ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
-			ui.Text(c, "包含到提交：").FontSize(11).Bold().TextColor(t.TextMuted)
-			ui.Text(c, fmt.Sprintf("%d 个改动块", len(m.hunks))).FontSize(11).TextColor(t.TextMuted)
-		})
-		layout.ScrollArea(c, layout.ScrollAreaProps{}, func() {
-			ui.Row(c).Gap(12).FillWidth().Children(func() {
-				for i := range m.hunks {
-					h := &m.hunks[i]
-					label := fmt.Sprintf("块 %d · %s", i+1, h.ID())
-					choice.Checkbox(c, m.hunkCheckedBind(i), label, choice.CheckboxProps{Size: 13})
-				}
-			})
-		}).MaxHeight(40)
-	})
-}
-
-// placeholder centers helper text in the pane.
-func (a *app) placeholder(c *ui.Context, t *ui.Theme, text string) {
-	ui.Column(c).Fill().Center().Children(func() {
-		ui.Text(c, text).TextColor(t.TextMuted)
-	})
-}
-
-// commitBarView: message + options + actions.
-func (a *app) commitBarView(c *ui.Context, t *ui.Theme) {
-	m := &a.commit
-	tk := theme.TokensOf(c)
-	ui.Column(c).FillWidth().Padding(10, 16).Gap(8).Background(tk.BgContainer).Children(func() {
-		ui.Row(c).Gap(10).AlignItems(ui.Start).Children(func() {
-			ui.Column(c).Grow(1).Gap(4).Children(func() {
-				field.TextArea(c, &m.message, field.TextAreaProps{
-					Placeholder: "提交信息…",
-					MinRows:     3,
-					MaxRows:     8,
-				}).Grow(1)
-				ui.Row(c).Gap(14).AlignItems(ui.Center).Children(func() {
-					choice.Checkbox(c, &m.amend, "修改上一次提交", choice.CheckboxProps{Size: 14})
-					choice.Checkbox(c, &m.noVerify, "跳过 Git hooks", choice.CheckboxProps{Size: 14})
-					ui.Text(c, "").Grow(1)
-					action.Button(c, "模板", action.ButtonProps{Variant: action.Text, Size: theme.Small}).
-						Disabled(m.busy).OnClick(func() { m.loadTemplate(a.updater()) })
-					action.Button(c, "检查", action.ButtonProps{Variant: action.Text, Size: theme.Small}).
-						Disabled(m.busy).OnClick(func() {
-						m.preChecksOpen = !m.preChecksOpen
-						if m.preChecksOpen && !m.preChecksLoaded {
-							m.loadPreChecks(a.updater())
-						}
-					})
-					ui.Text(c, checkedCount(m.Snap, m.checks)).TextColor(t.TextMuted)
-				})
-				if m.preChecksOpen {
-					a.preChecksView(c, t)
-				}
-			})
-			ui.Column(c).Gap(6).Children(func() {
-				action.Button(c, "提交", action.ButtonProps{Variant: action.Primary, Size: theme.Middle}).
-					Disabled(m.busy).OnClick(a.doCommit).MinWidth(110)
-				action.Button(c, "提交并推送", action.ButtonProps{Variant: action.Default, Size: theme.Middle}).
-					Disabled(m.busy).OnClick(a.doCommitPush).MinWidth(110)
-			})
-		})
-	})
-}
-
-// preChecksView renders the commit-checks drawer (IDEA's "Checks"):
-// TODO count, whitespace warnings, hooks presence. Advisory only.
-func (a *app) preChecksView(c *ui.Context, t *ui.Theme) {
-	m := &a.commit
-	tk := theme.TokensOf(c)
-	ui.Column(c).FillWidth().Gap(6).Padding(8, 12).Radius(6).
-		Border(1, tk.BorderSecondary).Background(tk.BgLayout).
-		Children(func() {
-			ui.Row(c).FillWidth().AlignItems(ui.Center).Children(func() {
-				ui.Text(c, "提交前检查").Bold().FontSize(12)
-				ui.Text(c, "").Grow(1)
-				if m.preChecksLoad {
-					ui.Text(c, "检查中…").FontSize(11).TextColor(t.TextMuted)
-				}
-			})
-			if m.preChecks == nil {
-				ui.Text(c, "尚未运行检查").FontSize(11).TextColor(t.TextMuted)
-				return
-			}
-			pc := m.preChecks
-			// TODO/FIXME count.
-			ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
-				if pc.TODOCount == 0 {
-					display.Tag(c, "✓", display.TagProps{Variant: display.TagBorderless, Color: display.TagSuccess})
-					ui.Text(c, "没有 TODO/FIXME").FontSize(12)
-				} else {
-					display.Tag(c, fmt.Sprintf("%d", pc.TODOCount), display.TagProps{Variant: display.TagBorderless, Color: display.TagWarning})
-					ui.Text(c, fmt.Sprintf("发现 %d 处 TODO/FIXME", pc.TODOCount)).FontSize(12)
-				}
-			})
-			// Whitespace errors.
-			ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
-				if len(pc.WhitespaceErr) == 0 {
-					display.Tag(c, "✓", display.TagProps{Variant: display.TagBorderless, Color: display.TagSuccess})
-					ui.Text(c, "没有空白问题").FontSize(12)
-				} else {
-					display.Tag(c, fmt.Sprintf("%d", len(pc.WhitespaceErr)), display.TagProps{Variant: display.TagBorderless, Color: display.TagWarning})
-					ui.Text(c, fmt.Sprintf("%d 处空白问题", len(pc.WhitespaceErr))).FontSize(12)
-				}
-			})
-			// Hooks.
-			ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
-				if pc.HasHooks {
-					display.Tag(c, "!", display.TagProps{Variant: display.TagBorderless, Color: display.TagInfo})
-					ui.Text(c, "存在 pre-commit 钩子").FontSize(12)
-				} else {
-					display.Tag(c, "✓", display.TagProps{Variant: display.TagBorderless, Color: display.TagSuccess})
-					ui.Text(c, "无 pre-commit 钩子").FontSize(12)
-				}
-			})
-			// First few whitespace details.
-			if len(pc.WhitespaceErr) > 0 {
-				show := pc.WhitespaceErr
-				if len(show) > 4 {
-					show = show[:4]
-				}
-				for _, ln := range show {
-					ui.Text(c, "  "+ln).FontSize(11).TextColor(t.TextMuted).SingleLine()
-				}
-				if len(pc.WhitespaceErr) > 4 {
-					ui.Text(c, fmt.Sprintf("  …还有 %d 条", len(pc.WhitespaceErr)-4)).FontSize(11).TextColor(t.TextMuted)
-				}
-			}
-		})
-}
-
-// doCommit runs the selective commit on the ticked set — the same path
-// for both view modes (changelist and IDEA's "Local Changes" split
-// differ only in grouping, not in what a tick means).
-func (a *app) doCommit() {
-	m := &a.commit
-	if m.busy {
-		return
-	}
-	m.commitSelected(appCTX, a.updater())
-}
-
-// doCommitPush opens the push dialog flagged "commit first" — the
-// actual commit+push runs only after the user confirms in the modal.
-func (a *app) doCommitPush() {
-	m := &a.commit
-	if m.busy {
-		return
-	}
-	a.commit.openPushDialog(a.updater(), true)
-}
-
-// checkedCount summarizes the selection for the bar.
-func checkedCount(snap *git.Snapshot, cb checkboxes) string {
-	if snap == nil {
-		return "0 of 0"
-	}
-	checked := cb.checkedSet()
-	total, n := 0, 0
-	for _, r := range rowsFor(snap) {
-		if r.change.Conflict() {
-			continue
-		}
-		total++
-		if checked[r.change.Path] {
-			n++
-		}
-	}
-	return fmt.Sprintf("%d of %d", n, total)
-}
-
-// statusTagColor maps file status to a Tag color.
-func statusTagColor(k git.FileKind) display.TagColor {
-	switch k {
-	case git.KindUnmerged, git.KindDeleted:
-		return display.TagError
-	case git.KindUntracked, git.KindAdded:
-		return display.TagSuccess
-	case git.KindRenamed:
-		return display.TagInfo
-	case git.KindModified, git.KindTypechange:
-		return display.TagWarning
-	default:
-		return display.TagGray
-	}
-}
-
-// statusColor picks a row's status color (kept for non-tag uses).
-func statusColor(t *ui.Theme, k git.FileKind) ui.Color {
-	switch k {
-	case git.KindUnmerged, git.KindDeleted:
-		return t.Danger
-	case git.KindUntracked, git.KindAdded:
-		return t.Success
-	default:
-		return t.Text
-	}
-}
-
-// statusGlyph uses IDEA's per-type letters.
-func statusGlyph(k git.FileKind) string {
-	switch k {
-	case git.KindModified:
-		return "M"
-	case git.KindAdded:
-		return "A"
-	case git.KindDeleted:
-		return "D"
-	case git.KindRenamed:
-		return "R"
-	case git.KindTypechange:
-		return "T"
-	case git.KindUntracked:
-		return "U"
-	case git.KindUnmerged:
-		return "C"
-	}
-	return "?"
-}
-
-// aheadBehind formats "+2 −1".
-func aheadBehind(s *git.Snapshot) string {
-	if s.Ahead < 0 && s.Behind < 0 {
-		return ""
-	}
-	var parts []string
-	if s.Ahead > 0 {
-		parts = append(parts, "+"+fmt.Sprint(s.Ahead))
-	}
-	if s.Behind > 0 {
-		parts = append(parts, "−"+fmt.Sprint(s.Behind))
-	}
-	return strings.Join(parts, " ")
-}
-
-// baseName is filepath.Base.
-func baseName(p string) string {
-	if p == "" {
-		return ""
-	}
-	if i := strings.LastIndexByte(p, os.PathSeparator); i >= 0 {
-		return p[i+1:]
-	}
-	return p
 }
 
 // --- 通知 toast ---------------------------------------------------------
@@ -4182,29 +1678,5 @@ func (a *app) toastLayer(c *ui.Context, t *ui.Theme) {
 		c.AddToast(ui.Toast{Title: ts.text, Type: ts.kind, Timeout: 4 * time.Second})
 	}
 	a.toasts = nil
-	ui.ToastViewportBase(c, func(viewport ui.Element, toasts []ui.Toast) {
-		viewport.Padding(16).AlignItems(ui.End).Gap(8)
-		for _, ts := range toasts {
-			tp := ui.ToastBase(c, ts)
-			color := t.TextMuted
-			icon := "ℹ"
-			switch ts.Type {
-			case "success":
-				color = t.Success
-				icon = "✓"
-			case "error":
-				color = t.Danger
-				icon = "✕"
-			}
-			tp.Root.Row().Gap(10).Padding(10, 14).Radius(8).Width(340).
-				Background(t.Inverse).Shadow(0, 4, 16, 0, ui.RGBA(0, 0, 0, 0.4))
-			tp.Root.Children(func() {
-				ui.Text(c, icon).TextColor(color)
-				ui.Text(c, ts.Title).Grow(1)
-				tp.CloseButton().Label("关闭").Children(func() {
-					ui.Text(c, "×").TextColor(t.TextMuted)
-				})
-			})
-		}
-	})
+	components.ToastStack(c, t)
 }

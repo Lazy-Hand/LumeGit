@@ -32,10 +32,11 @@ type RebaseEntry struct {
 
 // RebasePlan lists HEAD's commits back to (exclusive) onto — the set
 // IDEA's "Interactively Rebase from Here" shows. Oldest first, same
-// order the todo file uses.
+// order the todo file uses. --no-merges: a "pick <merge>" todo is
+// rejected by git and leaves the sequencer stuck mid-flight.
 func (r *Repo) RebasePlan(ctx context.Context, onto string) ([]RebaseEntry, error) {
-	res, err := r.Run(ctx, "log", "--reverse",
-		"--format=%H%x1f%h%x1f%s%x1e", onto+"..HEAD")
+	res, err := r.Run(ctx, "log", "--reverse", "--no-merges",
+		"--format=%H%x1f%h%x1f%s%x1e", onto+"..HEAD", "--")
 	if err != nil {
 		return nil, err
 	}
@@ -76,20 +77,44 @@ func (r *Repo) InteractiveRebase(ctx context.Context, onto string, entries []Reb
 	if len(entries) == 0 {
 		return nil, fmt.Errorf("rebase: empty plan")
 	}
-	dir, err := os.MkdirTemp("", "lumegit-rebase-*")
-	if err != nil {
+	// Persist the helpers inside .git instead of /tmp: the temp dir used
+	// to be deleted when rebase paused on a conflict or 'edit', so a
+	// later `rebase --continue` lost every queued reword/squash message.
+	// .git/lumegit-rebase survives the pause; git cleans it itself.
+	gd, derr := r.gitDir(ctx)
+	if derr != nil {
+		return nil, derr
+	}
+	dir := filepath.Join(gd, "lumegit-rebase")
+	_ = os.RemoveAll(dir) // stale helper set from an aborted run
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
-	defer os.RemoveAll(dir)
+	// Only remove when rebase actually finished; on failure the helper
+	// files stay so --continue still finds them. The seq script is only
+	// needed once but keeping it around is harmless.
+	defer func() {
+		if gd2, e2 := r.gitDir(context.Background()); e2 == nil {
+			if _, serr := os.Stat(filepath.Join(gd2, "rebase-merge")); os.IsNotExist(serr) {
+				_ = os.RemoveAll(dir)
+			}
+		}
+	}()
 
 	// The sequence-editor helper: receives the todo path as argv[1],
-	// writes our plan.
+	// writes our plan. A leading squash is illegal in git — rewrite it
+	// to fixup? No: git also rejects fixup on the first entry (it has
+	// nothing to fix into). Reject early with a readable error instead
+	// of letting the sequencer stop with an opaque todo complaint.
 	todo := filepath.Join(dir, "todo")
 	var b strings.Builder
-	for _, e := range entries {
+	for i, e := range entries {
 		act := e.Action
 		if act == "" {
 			act = RebasePick
+		}
+		if i == 0 && (act == RebaseSquash || act == RebaseFixup) {
+			return nil, fmt.Errorf("rebase: 第一条提交不能使用 %s（没有可合并的上一条）", act)
 		}
 		fmt.Fprintf(&b, "%s %s %s\n", act, e.OID, e.Subject)
 	}
@@ -105,28 +130,48 @@ func (r *Repo) InteractiveRebase(ctx context.Context, onto string, entries []Reb
 	}
 
 	// The message-editor helper: serves squash/fixup/reword message
-	// files. For each commit needing a message we precomputed it; the
-	// helper picks them in invocation order via a counter file.
+	// files. Git opens the editor ONCE per squash group (a run of
+	// squash/fixup lines) plus once per reword — so we queue one
+	// message per GROUP, not per squash entry; the old per-entry queue
+	// handed a reword entry the previous group's message.
 	msgDir := filepath.Join(dir, "msgs")
 	if err := os.MkdirAll(msgDir, 0o755); err != nil {
 		return nil, err
 	}
 	idx := 0
-	needs := map[RebaseAction]bool{RebaseReword: true, RebaseSquash: true}
-	for _, e := range entries {
-		if !needs[e.Action] {
-			continue
-		}
-		msg := e.Message
-		if msg == "" {
-			msg = e.Subject // keep original subject when user left it
-		}
-		if err := os.WriteFile(
-			filepath.Join(msgDir, fmt.Sprintf("%03d", idx)),
-			[]byte(msg+"\n"), 0o644); err != nil {
-			return nil, err
-		}
+	writeMsg := func(msg string) error {
+		path := filepath.Join(msgDir, fmt.Sprintf("%03d", idx))
 		idx++
+		return os.WriteFile(path, []byte(msg+"\n"), 0o644)
+	}
+	for i := 0; i < len(entries); i++ {
+		e := entries[i]
+		switch e.Action {
+		case RebaseReword:
+			msg := e.Message
+			if msg == "" {
+				msg = e.Subject
+			}
+			if err := writeMsg(msg); err != nil {
+				return nil, err
+			}
+		case RebaseSquash, RebaseFixup:
+			// End of a squash run: message comes from the LAST entry in
+			// the run (IDEA's "squash into" keeps the newest subject);
+			// empty entries fall back to their subject, skipping blanks.
+			j := i
+			for j+1 < len(entries) && (entries[j+1].Action == RebaseSquash || entries[j+1].Action == RebaseFixup) {
+				j++
+			}
+			msg := entries[j].Message
+			if msg == "" {
+				msg = entries[j].Subject
+			}
+			if err := writeMsg(msg); err != nil {
+				return nil, err
+			}
+			i = j // consumed the whole group
+		}
 	}
 	msgHelper := filepath.Join(dir, "msg.sh")
 	msgScript := "#!/bin/sh\n" +
@@ -139,7 +184,6 @@ func (r *Repo) InteractiveRebase(ctx context.Context, onto string, entries []Reb
 		return nil, err
 	}
 
-	// Debug trace: when set, helper scripts append to this file.
 	var env []string
 	env = append(env, os.Environ()...)
 	env = append(env,

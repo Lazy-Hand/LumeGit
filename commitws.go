@@ -1,18 +1,33 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
 	"time"
 
+	"github.com/egoist/mygo/ui/editor"
+
 	"lumegit/internal/git"
 	"lumegit/internal/store"
+	"lumegit/internal/svn"
+	"lumegit/internal/vcs"
 )
+
+// isSVN reports whether the open repo is an svn working copy — the one
+// gate every pane/dialog consults before showing a git-only feature
+// (staging, push, stash, reflog, bisect, branch/tag submenus…).
+func (m *commitModel) isSVN() bool {
+	return m.VCS != nil && m.VCS.Kind == vcs.KindSVN
+}
+
+// isGit is the inverse — true when the backend is git or not yet known.
+func (m *commitModel) isGit() bool { return !m.isSVN() }
 
 // commitModel holds all workspace state for the Commit tab of one
 // window. Everything UI-visible lives here; the view function reads it
@@ -20,6 +35,10 @@ import (
 // publish (set to win.Update in main.go).
 type commitModel struct {
 	RepoPath string // empty = no repo open yet
+	// VCS is the detected backend (git or svn). All repo ops go through
+	// it; Git-only fields stay nil on an svn WC so view code can hide
+	// the git-shaped affordances (staging area, push, rebase…).
+	VCS *vcs.Backend
 
 	// Repo manager: recent + pinned repositories.
 	repos *store.Manager
@@ -60,7 +79,14 @@ type commitModel struct {
 	initBusy bool
 
 	// Latest snapshot. Immutable once published; replaced wholesale.
-	Snap *git.Snapshot
+	// *vcs.Snapshot — git and svn fill the same row set; Snap.Git keeps
+	// the raw git snapshot for git-only affordances (staging area,
+	// detached HEAD, in-progress op, upstream counts) and is nil on svn.
+	Snap *vcs.Snapshot
+
+	// Sorted rows only change when the immutable snapshot is replaced.
+	rowsSnapshot *vcs.Snapshot
+	sortedRows   []fileRow
 
 	// File list filter text.
 	filter string
@@ -72,9 +98,15 @@ type commitModel struct {
 	selectedFile string
 
 	// Diff for the selected file, as displayed.
-	diffLoading bool
-	diff        *git.DiffInfo
-	diffErr     string
+	diffLoading  bool
+	diff         *git.DiffInfo
+	diffErr      string
+	diffPrepared *editor.DiffState // built on a worker, owned by UI after publication
+	// diffPath is which file diff belongs to — when selectedFile moves
+	// on but the new diff hasn't landed, the pane keeps showing the old
+	// one (greyed) instead of flashing a spinner; the header shows the
+	// incoming file's name. Keeps rapid arrow/click switching smooth.
+	diffPath string
 
 	// Commit draft per repo (single-repo first version: plain fields).
 	message  string
@@ -179,6 +211,13 @@ type commitModel struct {
 	bisectBad  string
 	bisectErr  string
 	bisectBusy bool
+
+	// svn:ignore panel — svn has no .gitignore file to open, so the
+	// app lists every directory's ignore patterns in one dialog.
+	ignoreOpen    bool
+	ignores       []svn.IgnoreEntry
+	ignoreLoading bool
+	ignoreErr     string
 }
 
 // rebaseDialog is the "Interactively Rebase from Here" plan state.
@@ -217,7 +256,9 @@ type pushDialog struct {
 }
 
 // revertAsk is the data behind the "are you sure" dialog for
-// destructive worktree actions.
+// destructive worktree actions. Run, when set, is the op to execute on
+// confirm (hard reset, stash drop, …) — the Paths/Delete branches cover
+// the file-scoped reverts.
 type revertAsk struct {
 	Open   bool
 	Title  string
@@ -225,6 +266,7 @@ type revertAsk struct {
 	Staged bool     // revert staged side vs worktree side
 	Paths  []string // for revert
 	Delete string   // single path for delete (untracked)
+	Run    func()   // custom confirm action (takes precedence over Paths/Delete)
 }
 
 // fileRow is one row of the changed-files list.
@@ -243,11 +285,30 @@ type listGroup struct {
 	CheckedN int // how many rows are ticked
 }
 
+// fileRows reuses the order while the immutable snapshot stays the same.
+// Callers must not modify the returned slice or its rows.
+func (m *commitModel) fileRows() []fileRow {
+	if m.rowsSnapshot != m.Snap {
+		m.rowsSnapshot = m.Snap
+		m.sortedRows = rowsFor(m.Snap)
+	}
+	return m.sortedRows
+}
+
 // groups organizes the visible rows into their changelists, in order:
 // named lists first (creation order), Default last so unmatched files
 // always show at the bottom — IDEA-style "everything else" bucket.
+// svn: 已忽略 文件拆成独立只读组垫底 —— 不参与提交、不挂变更列表。
 func (m *commitModel) groups() []listGroup {
-	rows := rowsFor(m.Snap)
+	all := m.fileRows()
+	var rows, ignored []fileRow
+	for _, r := range all {
+		if r.change.Kind == vcs.KindIgnored {
+			ignored = append(ignored, r)
+		} else {
+			rows = append(rows, r)
+		}
+	}
 	if m.lists == nil {
 		// No store loaded: single synthetic group holds everything.
 		g := listGroup{Name: store.DefaultName, Active: true, Rows: rows}
@@ -256,12 +317,29 @@ func (m *commitModel) groups() []listGroup {
 				g.CheckedN++
 			}
 		}
-		return []listGroup{g}
+		out := []listGroup{g}
+		if len(ignored) > 0 {
+			out = append(out, listGroup{Name: "已忽略", Rows: ignored})
+		}
+		return out
+	}
+	// Build the reverse index once instead of scanning every named list's
+	// paths for every row. Preserve ListOf's first-list-wins behavior.
+	assigned := make(map[string]string, len(rows))
+	for _, l := range m.lists.Lists {
+		for _, path := range l.Paths {
+			if _, exists := assigned[path]; !exists {
+				assigned[path] = l.Name
+			}
+		}
 	}
 	byList := map[string][]fileRow{}
 	checked := m.checks.checkedSet()
 	for _, r := range rows {
-		name := m.lists.ListOf(r.change.Path)
+		name, ok := assigned[r.change.Path]
+		if !ok {
+			name = m.lists.Default
+		}
 		r.list = name
 		byList[name] = append(byList[name], r)
 	}
@@ -283,6 +361,9 @@ func (m *commitModel) groups() []listGroup {
 		}
 	}
 	out = append(out, g)
+	if len(ignored) > 0 {
+		out = append(out, listGroup{Name: "已忽略", Rows: ignored})
+	}
 	return out
 }
 
@@ -295,6 +376,9 @@ func (m *commitModel) reconcileLists() {
 	}
 	live := map[string]bool{}
 	for _, f := range m.Snap.Files {
+		if f.Kind == vcs.KindIgnored {
+			continue // ignored paths never join a changelist
+		}
 		live[f.Path] = true
 	}
 	m.lists.Reconcile(live)
@@ -306,9 +390,20 @@ func (m *commitModel) reconcileLists() {
 	if active == m.lists.Default {
 		return
 	}
+	assigned := make(map[string]bool, len(live))
+	for _, l := range m.lists.Lists {
+		for _, path := range l.Paths {
+			assigned[path] = true
+		}
+	}
+	target := m.lists.Find(active)
+	if target == nil {
+		return
+	}
 	for _, f := range m.Snap.Files {
-		if m.lists.ListOf(f.Path) == m.lists.Default {
-			m.lists.Assign(f.Path, active)
+		if f.Kind != vcs.KindIgnored && !assigned[f.Path] {
+			target.Paths = append(target.Paths, f.Path)
+			assigned[f.Path] = true
 		}
 	}
 }
@@ -317,24 +412,26 @@ func (m *commitModel) reconcileLists() {
 // (renames/mods/added/deleted), then untracked; alphabetical inside
 // each group. IDEA-style ordering: files that block commit surface
 // first.
-func rowsFor(snap *git.Snapshot) []fileRow {
+func rowsFor(snap *vcs.Snapshot) []fileRow {
 	if snap == nil {
 		return nil
 	}
-	kindRank := func(k git.FileKind) int {
+	kindRank := func(k vcs.FileKind) int {
 		switch k {
-		case git.KindUnmerged:
+		case vcs.KindUnmerged:
 			return 0
-		case git.KindModified, git.KindTypechange:
+		case vcs.KindModified, vcs.KindTypeChange:
 			return 1
-		case git.KindRenamed:
+		case vcs.KindRenamed:
 			return 2
-		case git.KindAdded:
+		case vcs.KindAdded:
 			return 3
-		case git.KindDeleted:
+		case vcs.KindDeleted:
 			return 4
-		case git.KindUntracked:
+		case vcs.KindUntracked:
 			return 5
+		case vcs.KindIgnored:
+			return 7 // 已忽略垫底 —— 查看用，不可提交
 		}
 		return 6
 	}
@@ -352,29 +449,28 @@ func rowsFor(snap *git.Snapshot) []fileRow {
 	return rows
 }
 
-// openRepo validates a directory as a git worktree and loads the first
-// snapshot. Runs on a worker; the UI thread calls this via win.Update
-// publication only.
-func openRepo(ctx context.Context, dir string) (*git.Snapshot, string, error) {
+// openRepo validates a directory as a git worktree or svn working copy
+// and loads the first snapshot. Runs on a worker; the UI thread calls
+// this via win.Update publication only.
+func openRepo(ctx context.Context, dir string) (*vcs.Snapshot, *vcs.Backend, error) {
 	if _, err := os.Stat(dir); err != nil {
-		return nil, "", fmt.Errorf("目录不存在：%v", err)
+		return nil, nil, fmt.Errorf("目录不存在：%v", err)
 	}
-	if cmd, err := exec.LookPath("git"); err != nil {
-		// Pin a precise error for the UI.
-		return nil, "", fmt.Errorf("找不到 git 可执行文件（查找路径 %q）", cmd)
-	}
-	repo, err := git.Open(ctx, dir)
+	b, err := vcs.Open(ctx, dir)
 	if err != nil {
-		return nil, "", err
+		return nil, nil, err
 	}
-	// Warm git's own file cache for this repo — cheap, idempotent, and
-	// every subsequent `status` gets faster.
-	repo.EnableFSMonitor(ctx)
-	snap, err := repo.Snapshot(ctx)
+	switch b.Kind {
+	case vcs.KindGit:
+		// Warm git's own file cache for this repo — cheap, idempotent,
+		// and every subsequent `status` gets faster.
+		b.Git.EnableFSMonitor(ctx)
+	}
+	snap, err := b.Snapshot(ctx)
 	if err != nil {
-		return nil, repo.Worktree, err
+		return nil, b, err
 	}
-	return snap, repo.Worktree, nil
+	return snap, b, nil
 }
 
 // refresh loads a fresh snapshot of the current repo. Generation
@@ -392,10 +488,19 @@ func (m *commitModel) refresh(ctx context.Context, w updater) {
 	gen := m.gen
 	m.setBusy(w, true, "正在获取状态…")
 	noUntracked := m.preferNoUntracked
+	isSVN := m.isSVN()
 	go func() {
-		repo := git.NewRepo(m.RepoPath)
-		repo.PreferNoUntracked = noUntracked
-		snap, err := repo.Snapshot(ctx)
+		var snap *vcs.Snapshot
+		var err error
+		if isSVN {
+			snap, err = m.VCS.Snapshot(ctx)
+		} else {
+			repo := git.NewRepo(m.RepoPath)
+			repo.PreferNoUntracked = noUntracked
+			var gs *git.Snapshot
+			gs, err = repo.Snapshot(ctx)
+			snap = vcs.WrapGit(gs)
+		}
 		w.update(func() {
 			m.refreshRunning = false
 			if gen != m.gen {
@@ -412,6 +517,10 @@ func (m *commitModel) refresh(ctx context.Context, w updater) {
 				m.reconcileLists()
 				m.pruneChecked()
 				m.ensureSelectedFile()
+				// The file the user is diffing may have changed under
+				// them (their own edit, an external tool) — refresh the
+				// pane when it's still in the new snapshot.
+				m.reloadSelectedDiff()
 			}
 		})
 	}()
@@ -426,7 +535,7 @@ func (m *commitModel) checkUntrackedFlood() {
 	}
 	n := 0
 	for _, f := range m.Snap.Files {
-		if f.Kind == git.KindUntracked {
+		if f.Kind == vcs.KindUntracked {
 			n++
 		}
 	}
@@ -449,10 +558,19 @@ func (m *commitModel) refreshQuiet(ctx context.Context, w updater) {
 	m.refreshRunning = true
 	gen := m.gen
 	noUntracked := m.preferNoUntracked
+	isSVN := m.isSVN()
 	go func() {
-		repo := git.NewRepo(m.RepoPath)
-		repo.PreferNoUntracked = noUntracked
-		snap, err := repo.Snapshot(ctx)
+		var snap *vcs.Snapshot
+		var err error
+		if isSVN {
+			snap, err = m.VCS.Snapshot(ctx)
+		} else {
+			repo := git.NewRepo(m.RepoPath)
+			repo.PreferNoUntracked = noUntracked
+			var gs *git.Snapshot
+			gs, err = repo.Snapshot(ctx)
+			snap = vcs.WrapGit(gs)
+		}
 		w.update(func() {
 			m.refreshRunning = false
 			if gen != m.gen {
@@ -468,6 +586,7 @@ func (m *commitModel) refreshQuiet(ctx context.Context, w updater) {
 				m.reconcileLists()
 				m.pruneChecked()
 				m.ensureSelectedFile()
+				m.reloadSelectedDiff()
 			}
 		})
 	}()
@@ -485,8 +604,26 @@ func (m *commitModel) startPolling(w updater) {
 	ctx, cancel := context.WithCancel(context.Background())
 	m.pollCancel = cancel
 	repoPath := m.RepoPath
+	isSVN := m.isSVN()
+	var wc *svn.WC
+	if isSVN {
+		wc = m.VCS.SVN // captured here: the worker must not read m.*
+	}
+	isActive := m.isActive
 	go func() {
-		interval := 2 * time.Second
+		// git: the refs probe is cheap, 2s focused / 10s background.
+		// svn: there are no refs — the probe is a full local `svn
+		// status` (a tree walk, like `git status`), so it runs less
+		// often; the server round trip (`status -u`, which reveals new
+		// remote revisions) only once a minute.
+		focused, background := 2*time.Second, 10*time.Second
+		if isSVN {
+			focused, background = 5*time.Second, 30*time.Second
+		}
+		const svnRemoteEvery = time.Minute
+		var remoteFP string
+		var lastRemote time.Time
+		interval := focused
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {
@@ -494,18 +631,33 @@ func (m *commitModel) startPolling(w updater) {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				// Adaptive: 2s focused, 10s background.
-				want := 2 * time.Second
-				if m.isActive != nil && !m.isActive() {
-					want = 10 * time.Second
+				// Adaptive cadence by window focus.
+				want := focused
+				if isActive != nil && !isActive() {
+					want = background
 				}
 				if want != interval {
 					interval = want
 					ticker.Reset(interval)
 					continue
 				}
-				repo := git.NewRepo(repoPath)
-				fp, err := repo.RefsFingerprint(ctx)
+				var fp string
+				var err error
+				if isSVN {
+					fp, err = svnLocalFingerprint(ctx, wc)
+					if err == nil && time.Since(lastRemote) >= svnRemoteEvery {
+						// Remote part is cached between checks so the
+						// combined fingerprint only flips on real change.
+						if rfp, rerr := svnRemoteFingerprint(ctx, wc); rerr == nil {
+							remoteFP = rfp
+						}
+						lastRemote = time.Now()
+					}
+					fp += "\x00" + remoteFP
+				} else {
+					repo := git.NewRepo(repoPath)
+					fp, err = repo.RefsFingerprint(ctx)
+				}
 				if err != nil {
 					continue
 				}
@@ -528,6 +680,44 @@ func (m *commitModel) startPolling(w updater) {
 			}
 		}
 	}()
+}
+
+// svnLocalFingerprint summarizes the working copy's local status (no
+// server contact): any edit, add, delete or prop change flips it.
+func svnLocalFingerprint(ctx context.Context, wc *svn.WC) (string, error) {
+	items, err := wc.Status(ctx, false)
+	if err != nil {
+		return "", err
+	}
+	var b strings.Builder
+	for _, it := range items {
+		b.WriteString(it.Path)
+		b.WriteByte(byte(it.TextStatus))
+		b.WriteByte(byte(it.PropStatus))
+		b.WriteByte(0)
+	}
+	return b.String(), nil
+}
+
+// svnRemoteFingerprint captures only the server-side half of
+// `status -u` (out-of-date entries + the revision compared against), so
+// a new remote commit flips it without local edits interfering.
+func svnRemoteFingerprint(ctx context.Context, wc *svn.WC) (string, error) {
+	items, err := wc.Status(ctx, true)
+	if err != nil {
+		return "", err
+	}
+	var b strings.Builder
+	for _, it := range items {
+		if !it.OOD {
+			continue
+		}
+		b.WriteString(it.Path)
+		b.WriteByte(byte(it.ReposTextStatus))
+		b.WriteByte(byte(it.ReposPropStatus))
+		b.WriteByte(0)
+	}
+	return b.String(), nil
 }
 
 // stopPolling kills the poller. Called when the repo closes.
@@ -577,26 +767,36 @@ func (cb *checkboxes) checkedSet() map[string]bool {
 }
 
 // revertPaths discards worktree changes for the given paths (git
-// restore), then refreshes. Confirmed destructive: bytes never staged
-// or committed are lost. For a staged path the caller may pass
-// staged=true to also rewind the index to HEAD.
+// restore / svn revert), then refreshes. Confirmed destructive: bytes
+// never staged or committed are lost. For a staged path the caller may
+// pass staged=true to also rewind the index to HEAD (git only).
 func (m *commitModel) revertPaths(ctx context.Context, w updater, paths []string, staged bool) {
 	if m.busy || len(paths) == 0 {
 		return
 	}
 	m.gen++
 	gen := m.gen
-	repoPath := m.RepoPath
 	m.setBusy(w, true, "正在回滚…")
 	go func() {
-		repo := git.NewRepo(repoPath)
 		var err error
-		if staged {
-			err = repo.RevertStagedPaths(ctx, paths)
+		var snap *vcs.Snapshot
+		if m.isSVN() {
+			for _, p := range paths {
+				if _, rerr := m.VCS.SVN.Revert(ctx, p, true); rerr != nil {
+					err = rerr
+					break
+				}
+			}
+			snap, _ = m.VCS.Snapshot(context.Background())
 		} else {
-			err = repo.RevertPaths(ctx, paths)
+			repo := git.NewRepo(m.RepoPath)
+			if staged {
+				err = repo.RevertStagedPaths(ctx, paths)
+			} else {
+				err = repo.RevertPaths(ctx, paths)
+			}
+			snap = vcs.WrapGit(mustSnap(repo, ctx))
 		}
-		snap, _ := repo.Snapshot(context.Background())
 		w.update(func() {
 			if gen != m.gen {
 				return
@@ -619,8 +819,17 @@ func (m *commitModel) revertPaths(ctx context.Context, w updater, paths []string
 	}()
 }
 
+// mustSnap re-reads a git snapshot after an op; the error is swallowed
+// because the op's own error already reached the UI.
+func mustSnap(repo *git.Repo, ctx context.Context) *git.Snapshot {
+	s, _ := repo.Snapshot(ctx)
+	return s
+}
+
 // deleteUntracked removes an untracked file (only allowed on untracked
 // records — anything tracked goes through revert, which keeps the file).
+// On svn an unversioned path just gets deleted from disk; a versioned
+// path runs `svn delete` (scheduled for removal, file gone from disk).
 func (m *commitModel) deleteUntracked(ctx context.Context, w updater, path string) {
 	if m.busy || path == "" {
 		return
@@ -630,9 +839,20 @@ func (m *commitModel) deleteUntracked(ctx context.Context, w updater, path strin
 	repoPath := m.RepoPath
 	m.setBusy(w, true, "正在删除…")
 	go func() {
-		repo := git.NewRepo(repoPath)
-		err := repo.DeletePath(ctx, path)
-		snap, _ := repo.Snapshot(context.Background())
+		var err error
+		var snap *vcs.Snapshot
+		if m.isSVN() {
+			if f := m.Snap.Find(path); f != nil && f.Kind != vcs.KindUntracked {
+				_, err = m.VCS.SVN.Delete(ctx, path, false)
+			} else {
+				err = os.Remove(filepath.Join(repoPath, filepath.FromSlash(path)))
+			}
+			snap, _ = m.VCS.Snapshot(context.Background())
+		} else {
+			repo := git.NewRepo(repoPath)
+			err = repo.DeletePath(ctx, path)
+			snap = vcs.WrapGit(mustSnap(repo, context.Background()))
+		}
 		w.update(func() {
 			if gen != m.gen {
 				return
@@ -683,7 +903,7 @@ func (m *commitModel) ignorePath(ctx context.Context, w updater, path string) {
 				m.syncOK = "已加入 .gitignore"
 			}
 			if snap != nil {
-				m.Snap = snap
+				m.Snap = vcs.WrapGit(snap)
 				m.reconcileLists()
 				m.pruneChecked()
 				m.ensureSelectedFile()
@@ -721,7 +941,7 @@ func (m *commitModel) shelvePaths(ctx context.Context, w updater, paths []string
 				m.clearChecked(paths)
 			}
 			if snap != nil {
-				m.Snap = snap
+				m.Snap = vcs.WrapGit(snap)
 				m.reconcileLists()
 				m.pruneChecked()
 				m.ensureSelectedFile()
@@ -759,7 +979,7 @@ func (m *commitModel) shelveToShelf(ctx context.Context, w updater, paths []stri
 				m.clearChecked(paths)
 			}
 			if snap != nil {
-				m.Snap = snap
+				m.Snap = vcs.WrapGit(snap)
 				m.reconcileLists()
 				m.pruneChecked()
 				m.ensureSelectedFile()
@@ -825,7 +1045,7 @@ func (m *commitModel) runOp(ctx context.Context, w updater, busyText, doneText s
 				m.syncOK = doneText
 			}
 			if snap != nil {
-				m.Snap = snap
+				m.Snap = vcs.WrapGit(snap)
 				m.reconcileLists()
 				m.pruneChecked()
 				m.ensureSelectedFile()
@@ -1004,12 +1224,18 @@ func (m *commitModel) saveLists() {
 
 // pruneChecked drops checkmarks whose file no longer appears in the
 // snapshot (deleted elsewhere, renamed away, or committed outside).
+// Snap.Find is linear, so this builds the live set once — the per-path
+// scan version was O(checks × files) on every refresh.
 func (m *commitModel) pruneChecked() {
-	if m.checks.byPath == nil {
+	if m.checks.byPath == nil || m.Snap == nil {
 		return
 	}
+	live := make(map[string]bool, len(m.Snap.Files))
+	for i := range m.Snap.Files {
+		live[m.Snap.Files[i].Path] = true
+	}
 	for p := range m.checks.byPath {
-		if m.Snap.Find(p) == nil {
+		if !live[p] {
 			delete(m.checks.byPath, p)
 		}
 	}
@@ -1024,9 +1250,19 @@ func (m *commitModel) ensureSelectedFile() {
 	if rows := rowsFor(m.Snap); len(rows) > 0 {
 		m.selectFile(rows[0].change)
 	} else {
+		m.diffGen++
+		if m.diffCancel != nil {
+			m.diffCancel()
+			m.diffCancel = nil
+		}
 		m.selectedFile = ""
 		m.diff = nil
+		m.diffPrepared = nil
+		m.diffPath = ""
 		m.diffErr = ""
+		m.diffLoading = false
+		m.hunks = nil
+		m.hunkCheck = nil
 	}
 }
 
@@ -1035,8 +1271,17 @@ func (m *commitModel) ensureSelectedFile() {
 // so stale results can't overwrite the newest selection's diff and the
 // UI doesn't flicker through an old file's content.
 func (m *commitModel) selectFile(f git.FileChange) {
-	if m.selectedFile == f.Path && !m.diffLoading && m.diff != nil {
-		return // re-picking the same loaded file: nothing to do
+	if m.selectedFile == f.Path {
+		if m.diffLoading {
+			// Same file still loading — don't restart its worker, that
+			// only defers the result and is what makes a double-click on
+			// one row look like "selection didn't take".
+			return
+		}
+		if m.diff != nil {
+			return // already loaded: nothing to do
+		}
+		// diff == nil && !diffLoading: a previous load errored — retry.
 	}
 	m.diffGen++ // cancel any in-flight diff worker
 	gen := m.diffGen
@@ -1044,9 +1289,16 @@ func (m *commitModel) selectFile(f git.FileChange) {
 		m.diffCancel() // abort the previous file's git work
 	}
 	m.selectedFile = f.Path
+	// Drop the old diff the moment the pick changes — the pane switches
+	// to its loading state this same frame instead of repainting the
+	// previous file's DiffView (that repaint is the click lag).
 	m.diff = nil
+	m.diffPrepared = nil
+	m.diffPath = ""
 	m.diffErr = ""
 	m.diffLoading = true
+	m.hunks = nil
+	m.hunkCheck = nil
 	path, origPath := f.Path, f.OrigPath
 	repoPath := m.RepoPath
 	update := m.publish
@@ -1059,42 +1311,116 @@ func (m *commitModel) selectFile(f git.FileChange) {
 	ctx, cancel := context.WithCancel(context.Background())
 	m.diffCancel = cancel
 
+	isSVN := m.isSVN()
+	backend := m.VCS
 	go func() {
 		defer cancel()
-		d, derr := loadDiffCtx(ctx, repoPath, path, origPath, gen, m)
-		// Load the file's hunks for partial-commit checkboxes — only for
-		// a tracked modify (untracked/new/deleted files are all-or-nothing).
+		var d *git.DiffInfo
+		var derr error
 		var hunks []git.Hunk
-		if derr == nil && origPath == "" {
-			repo := git.NewRepo(repoPath)
-			hunks, _ = repo.FileHunks(ctx, path)
+		if isSVN {
+			d, derr = svnFileDiff(ctx, backend.SVN, path)
+		} else {
+			d, derr = loadDiffCtx(ctx, repoPath, path, origPath)
 		}
+		var prepared *editor.DiffState
+		if ctx.Err() == nil && derr == nil && d != nil && !d.Binary {
+			prepared = prepareDiffState(ctx, d)
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		// Show the diff as soon as it is ready. The separate Git hunk
+		// query is for the optional partial-commit controls and must not
+		// delay the primary diff pane.
 		w.update(func() {
-			if gen != m.diffGen {
+			if gen != m.diffGen || m.selectedFile != path {
 				return
 			}
 			m.diffLoading = false
 			if derr != nil && d == nil {
-				if m.selectedFile == path {
-					m.diffErr = derr.Error()
-					m.diff = nil
-					m.hunks = nil
-					m.hunkCheck = nil
-				}
+				m.diffErr = derr.Error()
 				return
 			}
-			if m.selectedFile == path {
-				m.diff, m.diffErr = d, ""
-				m.hunks = hunks
-				m.hunkCheck = nil // reset: lazily default all-ticked on commit
-			}
+			m.diff, m.diffErr = d, ""
+			m.diffPrepared = prepared
+			m.diffPath = path
 		})
+		if !isSVN && derr == nil && origPath == "" && d != nil && !d.Binary && ctx.Err() == nil {
+			repo := git.NewRepo(repoPath)
+			hunks, _ = repo.FileHunks(ctx, path)
+			if ctx.Err() != nil {
+				return
+			}
+			w.update(func() {
+				if gen != m.diffGen || m.selectedFile != path {
+					return
+				}
+				m.hunks = hunks
+				m.hunkCheck = nil // lazily default all-ticked
+			})
+		}
 	}()
 }
 
+// Only one worker at a time may run the editor's full, non-cancellable
+// line comparison. Queued selections can still be cancelled immediately.
+var diffPrepareSlot = make(chan struct{}, 1)
+
+// prepareDiffState constructs and warms the editor model off the UI
+// thread. The caller transfers exclusive ownership after publication;
+// a cancelled or superseded state is never exposed to the view.
+func prepareDiffState(ctx context.Context, d *git.DiffInfo) *editor.DiffState {
+	select {
+	case diffPrepareSlot <- struct{}{}:
+	case <-ctx.Done():
+		return nil
+	}
+	defer func() { <-diffPrepareSlot }()
+	if ctx.Err() != nil {
+		return nil
+	}
+	state := newDiffState(d)
+	state.Hunks()
+	if ctx.Err() != nil {
+		return nil
+	}
+	return state
+}
+
+// inlineMaxLines caps how many changed lines a diff may carry before its
+// word-level highlight is skipped: inline diff pairs every changed old
+// line with a new one (alignBySimilarity + per-line inlineDiff) on the
+// draw path, the single largest frame cost of a huge pick. Diffs past
+// the cap still get the added/removed line tints, just not the word
+// marks inside them.
+const inlineMaxLines = 2000
+
+// newDiffState builds the viewer state for one file diff, degrading the
+// word-level highlight to DiffInlineNone when the change is too big to
+// compute per frame. Every DiffState in the app comes from here so all
+// diff panes share the same budget.
+func newDiffState(d *git.DiffInfo) *editor.DiffState {
+	var old, new string
+	if d != nil {
+		old, new = string(d.Old), string(d.New)
+	}
+	s := &editor.DiffState{
+		Old: editor.NewBuffer(old),
+		New: editor.NewBuffer(new),
+	}
+	// A changed line can't exceed the shorter side's size, so the raw
+	// payload bounds the inline work without running the diff twice.
+	if d != nil && min(bytes.Count(d.Old, []byte{'\n'}), bytes.Count(d.New, []byte{'\n'})) > inlineMaxLines {
+		s.Inline = editor.DiffInlineNone
+	}
+	return s
+}
+
 // loadDiffCtx resolves one file's diff for the UI from a background
-// goroutine; ctx cancels stale work.
-func loadDiffCtx(ctx context.Context, repoPath, path, origPath string, wantGen int, m *commitModel) (*git.DiffInfo, error) {
+// goroutine; ctx cancels stale work. Git only — svn goes through
+// svnFileDiff.
+func loadDiffCtx(ctx context.Context, repoPath, path, origPath string) (*git.DiffInfo, error) {
 	repo := git.NewRepo(repoPath)
 	var d *git.DiffInfo
 	var err error
@@ -1106,9 +1432,50 @@ func loadDiffCtx(ctx context.Context, repoPath, path, origPath string, wantGen i
 	if err != nil {
 		return nil, err
 	}
-	// A stale result is caught by the caller's gen check.
-	_ = wantGen
 	return d, nil
+}
+
+// svnFileDiff fills the diff pane for an svn row: BASE vs worktree.
+// Untracked/unversioned paths have no BASE side — cat returns "".
+func svnFileDiff(ctx context.Context, wc *svn.WC, path string) (*git.DiffInfo, error) {
+	dt, err := wc.FileDiffWorktree(ctx, path)
+	if err != nil {
+		return nil, err
+	}
+	return &git.DiffInfo{
+		Path:     dt.Path,
+		Old:      []byte(dt.Old),
+		New:      []byte(dt.New),
+		OldLabel: dt.OldLabel,
+		NewLabel: dt.NewLabel,
+		Binary:   looksBinary(dt.Old) || looksBinary(dt.New),
+	}, nil
+}
+
+// looksBinary flags content that isn't readable text — NULs or a big
+// share of control bytes mean it's an archive/class/etc., and the diff
+// view shows the binary placeholder instead of garbage.
+func looksBinary(s string) bool {
+	if len(s) == 0 {
+		return false
+	}
+	const limit = 8192
+	n := len(s)
+	if n > limit {
+		n = limit
+	}
+	var bad int
+	for i := 0; i < n; i++ {
+		b := s[i]
+		if b == 0 {
+			return true
+		}
+		// control bytes other than \t \n \r count toward "not text"
+		if b < 0x20 && b != '\t' && b != '\n' && b != '\r' {
+			bad++
+		}
+	}
+	return bad > n/10
 }
 
 // commitJobs drives the actual commit. Sequential guarded job per the
@@ -1125,8 +1492,8 @@ func (m *commitModel) commitSelected(ctx context.Context, w updater) {
 	rows := rowsFor(m.Snap)
 	for i := range rows {
 		row := &rows[i]
-		if !checked[row.change.Path] {
-			continue
+		if !checked[row.change.Path] || row.change.Kind == vcs.KindIgnored {
+			continue // ignored 行永远没有勾选状态，也不该进提交
 		}
 		if row.change.Kind == git.KindUntracked {
 			untracked = append(untracked, row.change.Path)
@@ -1141,23 +1508,30 @@ func (m *commitModel) commitSelected(ctx context.Context, w updater) {
 		m.lastErr = "提交信息为空"
 		return
 	}
+	if m.isSVN() {
+		all := append(append([]string{}, paths...), untracked...)
+		m.svnCommit(ctx, w, all)
+		return
+	}
 	m.gen++
 	gen := m.gen
 	repoPath := m.RepoPath
 	msg := m.message
 	amend := m.amend
-	partial := m.partialSelection()
+	partial, partialHunks := m.partialSelection(paths)
+	noVerify := m.noVerify
 	m.setBusy(w, true, "正在提交…")
 
 	go func() {
 		repo := git.NewRepo(repoPath)
 		out, cerr := repo.Commit(ctx, git.CommitRequest{
-			Paths:     paths,
-			Untracked: untracked,
-			Partial:   partial,
-			Message:   msg,
-			Amend:     amend,
-			NoVerify:  m.noVerify,
+			Paths:        paths,
+			Untracked:    untracked,
+			Partial:      partial,
+			PartialHunks: partialHunks,
+			Message:      msg,
+			Amend:        amend,
+			NoVerify:     noVerify,
 		})
 		// Refresh regardless, so the UI reflects reality either way.
 		snap, serr := repo.Snapshot(context.Background())
@@ -1184,7 +1558,357 @@ func (m *commitModel) commitSelected(ctx context.Context, w updater) {
 				w.Notify("success", "已提交")
 			}
 			if serr == nil {
+				m.Snap = vcs.WrapGit(snap)
+				m.pruneChecked()
+				m.ensureSelectedFile()
+			}
+			if errors.Is(cerr, git.ErrPartialStale) {
+				m.reloadSelectedDiff()
+			}
+		})
+	}()
+}
+
+// svnCommit runs an svn commit for the checked paths. Unversioned
+// (untracked) paths get `svn add` first — svn commit skips them
+// silently otherwise. Commit IS the push for svn, so unlike git there
+// is no staged vs pushed split.
+func (m *commitModel) svnCommit(ctx context.Context, w updater, paths []string) {
+	m.gen++
+	gen := m.gen
+	msg := m.message
+	m.setBusy(w, true, "正在提交…")
+	snap := m.Snap // captured on the UI thread — the worker must not read m.*
+	vcsB := m.VCS
+	repoPath := m.RepoPath
+	go func() {
+		wc := vcsB.SVN
+		var err error
+		// Auto-add unversioned paths so the commit includes them.
+		for _, p := range paths {
+			if f := snap.Find(p); f != nil && f.Kind == vcs.KindUntracked {
+				if _, aerr := wc.Add(ctx, p, true); aerr != nil {
+					err = fmt.Errorf("svn add %s: %w", p, aerr)
+					break
+				}
+			}
+		}
+		// `svn commit <dir>` recurses — a checked directory would sweep in
+		// every uncommitted descendant the user did NOT tick. Directories
+		// get --depth empty (their own prop-changes still commit); files
+		// keep the default depth.
+		var dirPaths, filePaths []string
+		for _, p := range paths {
+			if fi, serr := os.Stat(filepath.Join(repoPath, filepath.FromSlash(p))); serr == nil && fi.IsDir() {
+				dirPaths = append(dirPaths, p)
+			} else {
+				filePaths = append(filePaths, p)
+			}
+		}
+		var res *svn.CommitResult
+		if err == nil {
+			if len(filePaths) > 0 || len(dirPaths) == 0 {
+				res, err = wc.Commit(ctx, svn.CommitOptions{Message: msg, Paths: filePaths})
+			}
+			if err == nil && len(dirPaths) > 0 {
+				var dres *svn.CommitResult
+				dres, err = wc.Commit(ctx, svn.CommitOptions{Message: msg, Paths: dirPaths, Depth: "empty"})
+				if err == nil && res == nil {
+					res = dres
+				}
+			}
+		}
+		snap, _ := vcsB.Snapshot(context.Background())
+		w.update(func() {
+			if gen != m.gen {
+				return
+			}
+			m.setBusyQuiet()
+			switch {
+			case err != nil:
+				m.lastErr = err.Error()
+				w.Notify("error", "提交失败："+m.lastErr)
+			case res != nil && res.Failed:
+				m.lastErr = res.Reason
+				w.Notify("error", "提交失败："+m.lastErr)
+			default:
+				m.lastErr = ""
+				m.message = ""
+				m.checks = checkboxes{}
+				rev := ""
+				if res != nil && res.Rev > 0 {
+					rev = fmt.Sprintf(" (r%d)", res.Rev)
+				}
+				w.Notify("success", "已提交"+rev)
+			}
+			if snap != nil {
 				m.Snap = snap
+				m.pruneChecked()
+				m.ensureSelectedFile()
+			}
+		})
+	}()
+}
+
+// svnAdd brings an unversioned path under version control.
+func (m *commitModel) svnAdd(ctx context.Context, w updater, path string) {
+	if m.busy || path == "" {
+		return
+	}
+	m.gen++
+	gen := m.gen
+	m.setBusy(w, true, "正在添加…")
+	go func() {
+		_, err := m.VCS.SVN.Add(ctx, path, true)
+		snap, _ := m.VCS.Snapshot(context.Background())
+		w.update(func() {
+			if gen != m.gen {
+				return
+			}
+			m.setBusyQuiet()
+			if err != nil {
+				m.lastErr = "添加失败：" + err.Error()
+			} else {
+				m.lastErr = ""
+				m.syncOK = "已加入版本控制"
+			}
+			if snap != nil {
+				m.Snap = snap
+				m.reconcileLists()
+				m.pruneChecked()
+				m.ensureSelectedFile()
+			}
+		})
+	}()
+}
+
+// svnUnignorePath drops the ignore rule that covers path — walks the
+// parent chain's svn:ignore and removes the matching pattern.
+func (m *commitModel) svnUnignorePath(ctx context.Context, w updater, path string) {
+	if m.busy || path == "" {
+		return
+	}
+	m.gen++
+	gen := m.gen
+	m.setBusy(w, true, "正在取消忽略…")
+	go func() {
+		err := m.VCS.SVN.Unignore(ctx, path)
+		snap, _ := m.VCS.Snapshot(context.Background())
+		w.update(func() {
+			if gen != m.gen {
+				return
+			}
+			m.setBusyQuiet()
+			if err != nil {
+				m.lastErr = "取消忽略失败：" + err.Error()
+			} else {
+				m.lastErr = ""
+				m.syncOK = "已取消忽略"
+			}
+			if snap != nil {
+				m.Snap = snap
+				m.reconcileLists()
+				m.pruneChecked()
+				m.ensureSelectedFile()
+			}
+		})
+	}()
+}
+
+// svnIgnoreAdd appends path's basename to its parent's svn:ignore —
+// the "加入 .gitignore" counterpart, per-directory in svn.
+func (m *commitModel) svnIgnoreAdd(ctx context.Context, w updater, path string) {
+	if m.busy || path == "" {
+		return
+	}
+	m.gen++
+	gen := m.gen
+	m.setBusy(w, true, "正在更新 svn:ignore…")
+	go func() {
+		res, err := m.VCS.SVN.AddIgnore(ctx, path)
+		if err == nil && res != nil && !res.ExitOK() {
+			err = &svn.Error{Args: res.Args, Stderr: res.OutputOfStderr()}
+		}
+		snap, _ := m.VCS.Snapshot(context.Background())
+		w.update(func() {
+			if gen != m.gen {
+				return
+			}
+			m.setBusyQuiet()
+			if err != nil {
+				m.lastErr = "忽略失败：" + err.Error()
+			} else {
+				m.lastErr = ""
+				m.syncOK = "已加入 svn:ignore"
+			}
+			if snap != nil {
+				m.Snap = snap
+				m.reconcileLists()
+				m.pruneChecked()
+				m.ensureSelectedFile()
+			}
+		})
+	}()
+}
+
+// --- svn ignore panel --------------------------------------------------
+//
+// svn scatters ignore rules in per-directory svn:ignore properties —
+// nothing like a gitignore file to open. The panel lists every dir's
+// patterns so the user can see (and later edit) them in one place.
+
+// svnLoadIgnores refreshes the ignore dialog's rows.
+func (m *commitModel) svnLoadIgnores(ctx context.Context, w updater) {
+	m.gen++
+	gen := m.gen
+	m.ignoreLoading = true
+	m.ignoreErr = ""
+	go func() {
+		list, err := m.VCS.SVN.Ignores(ctx)
+		w.update(func() {
+			if gen != m.gen {
+				return
+			}
+			m.ignoreLoading = false
+			if err != nil {
+				m.ignoreErr = err.Error()
+				return
+			}
+			m.ignores = list
+		})
+	}()
+}
+
+// svnIgnoreRemove deletes one pattern from a dir's svn:ignore and
+// reloads the list.
+func (m *commitModel) svnIgnoreRemove(ctx context.Context, w updater, dir, pattern string) {
+	m.gen++
+	gen := m.gen
+	m.ignoreLoading = true
+	go func() {
+		d := dir
+		if d == "" {
+			d = "."
+		}
+		cur, err := m.VCS.SVN.PropGet(ctx, "svn:ignore", d)
+		var list []svn.IgnoreEntry
+		if err == nil {
+			var keep []string
+			for _, line := range strings.Split(cur, "\n") {
+				line = strings.TrimSpace(line)
+				if line != "" && line != pattern {
+					keep = append(keep, line)
+				}
+			}
+			var res *svn.RunResult
+			res, err = m.VCS.SVN.PropSet(ctx, "svn:ignore", strings.Join(keep, "\n")+"\n", d)
+			if err == nil && res != nil && !res.ExitOK() {
+				err = &svn.Error{Args: res.Args, Stderr: res.OutputOfStderr()}
+			}
+		}
+		if err == nil {
+			list, err = m.VCS.SVN.Ignores(ctx)
+		}
+		snap, _ := m.VCS.Snapshot(context.Background())
+		w.update(func() {
+			if gen != m.gen {
+				return
+			}
+			m.ignoreLoading = false
+			if err != nil {
+				m.ignoreErr = err.Error()
+				return
+			}
+			m.ignores = list
+			if snap != nil {
+				m.Snap = snap
+				m.reconcileLists()
+				m.pruneChecked()
+			}
+		})
+	}()
+}
+
+// svnUpdateToRev rolls the WC back/forward to a chosen revision —
+// svn's "checkout this commit". Conflicts land as 'C' rows like a
+// normal update.
+func (a *app) svnUpdateToRev(oid string) {
+	m := &a.commit
+	if m.busy || m.RepoPath == "" {
+		return
+	}
+	rev := svnRevNum(oid)
+	if rev <= 0 {
+		return
+	}
+	m.gen++
+	gen := m.gen
+	w := a.updater()
+	m.setBusy(w, true, "正在更新到 r"+fmt.Sprint(rev)+"…")
+	go func() {
+		res, err := m.VCS.SVN.Update(context.Background(), svn.UpdateOptions{Rev: rev, Accept: svn.AcceptPostpone})
+		snap, _ := m.VCS.Snapshot(context.Background())
+		w.update(func() {
+			if gen != m.gen {
+				return
+			}
+			m.setBusyQuiet()
+			switch {
+			case err != nil:
+				m.lastErr = "更新失败：" + err.Error()
+				w.Notify("error", m.lastErr)
+			default:
+				m.lastErr = ""
+				m.syncOK = fmt.Sprintf("已更新到 r%d", res.Revision)
+				w.Notify("success", m.syncOK)
+			}
+			if snap != nil {
+				m.Snap = snap
+				m.reconcileLists()
+				m.pruneChecked()
+				m.ensureSelectedFile()
+			}
+			a.history.lastLoadedRepo = "" // HEAD moved — refresh log view
+		})
+	}()
+}
+
+// svnUpdate runs `svn update` — svn's pull. Conflicts land as 'C'
+// status entries the user resolves through the normal conflict flow;
+// there is no merge-in-progress state to continue/abort.
+func (m *commitModel) svnUpdate(ctx context.Context, w updater) {
+	if m.busy || m.RepoPath == "" {
+		return
+	}
+	m.gen++
+	gen := m.gen
+	m.setBusy(w, true, "正在更新…")
+	go func() {
+		res, err := m.VCS.SVN.Update(ctx, svn.UpdateOptions{Accept: svn.AcceptPostpone})
+		snap, _ := m.VCS.Snapshot(context.Background())
+		w.update(func() {
+			if gen != m.gen {
+				return
+			}
+			m.setBusyQuiet()
+			switch {
+			case err != nil:
+				m.lastErr = "更新失败：" + err.Error()
+				w.Notify("error", m.lastErr)
+			default:
+				m.lastErr = ""
+				if res != nil {
+					m.syncOK = fmt.Sprintf("已更新到 r%d", res.Revision)
+					if len(res.Conflicted) > 0 {
+						w.Notify("warn", fmt.Sprintf("更新产生 %d 个冲突", len(res.Conflicted)))
+					} else {
+						w.Notify("success", m.syncOK)
+					}
+				}
+			}
+			if snap != nil {
+				m.Snap = snap
+				m.reconcileLists()
 				m.pruneChecked()
 				m.ensureSelectedFile()
 			}
@@ -1230,7 +1954,7 @@ func (m *commitModel) sync(ctx context.Context, w updater, kind string, fn func(
 				w.Notify("success", m.syncOK)
 			}
 			if snap != nil {
-				m.Snap = snap
+				m.Snap = vcs.WrapGit(snap)
 				m.pruneChecked()
 				m.ensureSelectedFile()
 			}
@@ -1322,11 +2046,21 @@ func (m *commitModel) openRebaseDialogPreset(w updater, onto, targetOID string, 
 				return
 			}
 			if targetOID != "" && action != "" {
+				found := false
 				for i := range entries {
 					if entries[i].OID == targetOID || entries[i].Short == targetOID {
 						entries[i].Action = action
+						found = true
 						break
 					}
+				}
+				// The target must be inside onto..HEAD — a filtered or
+				// merged-out commit can't be reworded/dropped this way,
+				// and opening the dialog with nothing marked would
+				// silently run a plain rebase.
+				if !found {
+					m.lastErr = "变基计划：目标提交 " + targetOID + " 不在 " + onto + "..HEAD 范围内"
+					return
 				}
 			}
 			m.rebaseDlg = rebaseDialog{Open: true, Onto: onto, Entries: entries}
@@ -1360,12 +2094,17 @@ func (m *commitModel) runInteractiveRebase(ctx context.Context, w updater) {
 			case res != nil && !res.ExitOK():
 				m.lastErr = res.OutputOfStderr()
 				w.Notify("error", "变基失败："+m.lastErr)
+			case snap != nil && snap.InProgress != "":
+				// 'edit' or a conflict paused mid-sequence: not done —
+				// the sequencer still needs continue/abort.
+				m.syncOK = "变基已暂停，等待继续/中止"
+				w.Notify("info", m.syncOK)
 			default:
 				m.syncOK = "变基完成"
 				w.Notify("success", m.syncOK)
 			}
 			if snap != nil {
-				m.Snap = snap
+				m.Snap = vcs.WrapGit(snap)
 			}
 		})
 	}()
@@ -1395,11 +2134,8 @@ func (m *commitModel) openPushDialog(w updater, afterCommit bool) {
 			}
 			d.Commits = commits
 			// A rewritten history (amend/rebase) diverged from the
-			// remote — IDEA enables force push in that case. Offer
-			// force-with-lease pre-ticked, never a bare --force.
-			if d.Diverged {
-				d.Force = true
-			}
+			// remote — the dialog shows a warning then, but ticking
+			// force-with-lease must stay the user's own click.
 		})
 	}()
 }
@@ -1427,8 +2163,8 @@ func (m *commitModel) commitThenPush(ctx context.Context, w updater) {
 	rows := rowsFor(m.Snap)
 	for i := range rows {
 		row := &rows[i]
-		if !checked[row.change.Path] {
-			continue
+		if !checked[row.change.Path] || row.change.Kind == vcs.KindIgnored {
+			continue // ignored 行永远没有勾选状态，也不该进提交
 		}
 		if row.change.Kind == git.KindUntracked {
 			untracked = append(untracked, row.change.Path)
@@ -1448,7 +2184,8 @@ func (m *commitModel) commitThenPush(ctx context.Context, w updater) {
 	repoPath := m.RepoPath
 	msg := m.message
 	amend := m.amend
-	partial := m.partialSelection()
+	partial, partialHunks := m.partialSelection(paths)
+	noVerify := m.noVerify
 	pushReq := git.PushRequest{
 		ForceWithLease: m.pushDlg.Force,
 		Tags:           m.pushDlg.PushTags,
@@ -1457,12 +2194,13 @@ func (m *commitModel) commitThenPush(ctx context.Context, w updater) {
 	go func() {
 		repo := git.NewRepo(repoPath)
 		out, cerr := repo.Commit(ctx, git.CommitRequest{
-			Paths:     paths,
-			Untracked: untracked,
-			Partial:   partial,
-			Message:   msg,
-			Amend:     amend,
-			NoVerify:  m.noVerify,
+			Paths:        paths,
+			Untracked:    untracked,
+			Partial:      partial,
+			PartialHunks: partialHunks,
+			Message:      msg,
+			Amend:        amend,
+			NoVerify:     noVerify,
 		})
 		var push *git.SyncResult
 		if cerr == nil && (out == nil || out.Error == nil) {
@@ -1496,9 +2234,12 @@ func (m *commitModel) commitThenPush(ctx context.Context, w updater) {
 				m.checks = checkboxes{}
 			}
 			if snap != nil {
-				m.Snap = snap
+				m.Snap = vcs.WrapGit(snap)
 				m.pruneChecked()
 				m.ensureSelectedFile()
+			}
+			if errors.Is(cerr, git.ErrPartialStale) {
+				m.reloadSelectedDiff()
 			}
 		})
 	}()
@@ -1537,10 +2278,24 @@ func (m *commitModel) setBusyQuiet() {
 
 // partialSelection returns the CommitRequest.Partial map for the
 // selected file only, or nil when every hunk is ticked / no hunk list
-// exists (the common whole-file case stays on the fast path).
-func (m *commitModel) partialSelection() map[string][]bool {
-	if m.selectedFile == "" || len(m.hunks) == 0 || len(m.hunkCheck) == 0 {
-		return nil
+// exists (the common whole-file case stays on the fast path). The file
+// must be part of this commit (in paths): a hunk pick on a file the user
+// then unticked must not sneak into the index. The second map carries
+// the hunks the picks index into, so Commit can refuse if the file
+// changed since.
+func (m *commitModel) partialSelection(paths []string) (map[string][]bool, map[string][]git.Hunk) {
+	if m.selectedFile == "" || m.diffLoading || m.diffPath != m.selectedFile || len(m.hunks) == 0 || len(m.hunkCheck) == 0 {
+		return nil, nil
+	}
+	inCommit := false
+	for _, p := range paths {
+		if p == m.selectedFile {
+			inCommit = true
+			break
+		}
+	}
+	if !inCommit {
+		return nil, nil
 	}
 	all := true
 	for _, on := range m.hunkCheck {
@@ -1550,12 +2305,27 @@ func (m *commitModel) partialSelection() map[string][]bool {
 		}
 	}
 	if all {
-		return nil
+		return nil, nil
 	}
 	// Copy so the worker isn't racing the UI's next tick.
 	sel := make([]bool, len(m.hunkCheck))
 	copy(sel, m.hunkCheck)
-	return map[string][]bool{m.selectedFile: sel}
+	hunks := make([]git.Hunk, len(m.hunks))
+	copy(hunks, m.hunks)
+	return map[string][]bool{m.selectedFile: sel}, map[string][]git.Hunk{m.selectedFile: hunks}
+}
+
+// reloadSelectedDiff forces the selected file's diff + hunk list to be
+// re-read (e.g. after a commit refused a stale hunk selection).
+func (m *commitModel) reloadSelectedDiff() {
+	if m.selectedFile == "" || m.Snap == nil {
+		return
+	}
+	if f := m.Snap.Find(m.selectedFile); f != nil {
+		m.diff = nil
+		m.diffLoading = false
+		m.selectFile(*f)
+	}
 }
 
 // loadLFS lazily fetches the tracked-pattern list + locks once per
@@ -1632,7 +2402,7 @@ func (m *commitModel) bisectOp(ctx context.Context, w updater, fn func(context.C
 				}
 			}
 			if snap != nil {
-				m.Snap = snap
+				m.Snap = vcs.WrapGit(snap)
 			}
 		})
 	}()
@@ -1708,13 +2478,23 @@ func (m *commitModel) createPatch(ctx context.Context, w updater, paths []string
 	gen := m.gen
 	repoPath := m.RepoPath
 	go func() {
-		repo := git.NewRepo(repoPath)
 		var err error
 		var out string
-		if commitOID != "" {
-			out, err = repo.CreatePatchFromCommit(ctx, commitOID, dest)
+		if m.isSVN() {
+			// svn diff already emits unified-diff — write it as the patch.
+			// commitOID holds "r<N>"; a non-rN oid falls back to worktree.
+			if rev := svnRevNum(commitOID); rev > 0 {
+				out, err = m.VCS.SVN.PatchRev(ctx, rev, dest)
+			} else {
+				out, err = m.VCS.SVN.PatchWorktree(ctx, paths, dest)
+			}
 		} else {
-			err = repo.CreatePatchFromWorktree(ctx, paths, dest)
+			repo := git.NewRepo(repoPath)
+			if commitOID != "" {
+				out, err = repo.CreatePatchFromCommit(ctx, commitOID, dest)
+			} else {
+				err = repo.CreatePatchFromWorktree(ctx, paths, dest)
+			}
 		}
 		w.update(func() {
 			if gen != m.gen {
@@ -1736,25 +2516,43 @@ func (m *commitModel) createPatch(ctx context.Context, w updater, paths []string
 }
 
 // applyPatch applies a .patch the user picked: git am for format-patch
-// files, git apply otherwise (IDEA: Apply Patch…).
+// files, git apply otherwise; svn patch for an svn working copy.
 func (m *commitModel) applyPatch(ctx context.Context, w updater, patchFile string) {
 	m.setBusy(w, true, "正在应用补丁…")
 	m.gen++
 	gen := m.gen
 	repoPath := m.RepoPath
 	go func() {
-		repo := git.NewRepo(repoPath)
-		data, rerr := os.ReadFile(patchFile)
-		var res *git.RunResult
 		var err error
-		if rerr != nil {
-			err = rerr
-		} else if git.LooksLikeMailPatch(data) {
-			res, err = repo.ApplyMailPatch(ctx, patchFile)
+		var snap *vcs.Snapshot
+		var stderr string
+		if m.isSVN() {
+			// `svn patch` returns a normal *RunResult (E155xxx errors come
+			// back as exit≠0 with stderr, same contract as git's).
+			// dryRun=false — this menu item means "apply", and a dry run
+			// reported success without changing a byte.
+			res, serr := m.VCS.SVN.Patch(ctx, patchFile, false)
+			err = serr
+			if res != nil && !res.ExitOK() {
+				stderr = res.OutputOfStderr()
+			}
+			snap, _ = m.VCS.Snapshot(context.Background())
 		} else {
-			res, err = repo.ApplyPatch(ctx, patchFile)
+			repo := git.NewRepo(repoPath)
+			data, rerr := os.ReadFile(patchFile)
+			var res *git.RunResult
+			if rerr != nil {
+				err = rerr
+			} else if git.LooksLikeMailPatch(data) {
+				res, err = repo.ApplyMailPatch(ctx, patchFile)
+			} else {
+				res, err = repo.ApplyPatch(ctx, patchFile)
+			}
+			if res != nil && !res.ExitOK() {
+				stderr = res.OutputOfStderr()
+			}
+			snap = vcs.WrapGit(mustSnap(repo, context.Background()))
 		}
-		snap, _ := repo.Snapshot(context.Background())
 		w.update(func() {
 			if gen != m.gen {
 				return
@@ -1763,8 +2561,8 @@ func (m *commitModel) applyPatch(ctx context.Context, w updater, patchFile strin
 			switch {
 			case err != nil:
 				m.lastErr = "应用补丁：" + err.Error()
-			case res != nil && !res.ExitOK():
-				m.lastErr = res.OutputOfStderr()
+			case stderr != "":
+				m.lastErr = stderr
 			default:
 				m.syncOK = "补丁已应用"
 			}

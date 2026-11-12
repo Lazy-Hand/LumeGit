@@ -273,3 +273,65 @@ func (e *GitError) Error() string {
 	}
 	return fmt.Sprintf("git %s: %s", strings.Join(e.Args, " "), e.Stderr)
 }
+
+// Identity is the commit authorship pair git stamps on each commit.
+// Repo returns the repository-level (local) values; Global returns the
+// user's global ~/.gitconfig fallback shown when no local override is
+// set — matching `git config user.name`'s own resolution order.
+type Identity struct {
+	Name  string
+	Email string
+}
+
+// Identity reads user.name + user.email. local=true limits to the
+// repo's .git/config; false resolves the effective value git would use
+// (local else global else system), which is what the UI shows as the
+// placeholder/default.
+func (r *Repo) Identity(ctx context.Context, local bool) (Identity, error) {
+	var id Identity
+	var err error
+	read := func(key string, dst *string) {
+		if err != nil {
+			return
+		}
+		args := []string{"config"}
+		if local {
+			args = append(args, "--local")
+		}
+		args = append(args, "--get", key)
+		res, rerr := r.Run(ctx, args...)
+		if rerr != nil {
+			err = rerr
+			return
+		}
+		if res.ExitOK() {
+			*dst = strings.TrimSpace(res.Output())
+		}
+		// exit 1 = unset: leave dst empty, not an error.
+	}
+	read("user.name", &id.Name)
+	read("user.email", &id.Email)
+	return id, err
+}
+
+// SetIdentity writes user.name + user.email at the repo (local) scope.
+// An empty value unsets that key so git falls back to the global one —
+// the same way leaving the field blank behaves in the settings UI.
+func (r *Repo) SetIdentity(ctx context.Context, id Identity) error {
+	set := func(key, val string) error {
+		if val == "" {
+			res, err := r.Run(ctx, "config", "--local", "--unset", key)
+			if err != nil {
+				return err
+			}
+			_ = res // exit 1 = already unset: fine
+			return nil
+		}
+		_, err := r.RunOK(ctx, "config", "--local", key, val)
+		return err
+	}
+	if err := set("user.name", strings.TrimSpace(id.Name)); err != nil {
+		return err
+	}
+	return set("user.email", strings.TrimSpace(id.Email))
+}

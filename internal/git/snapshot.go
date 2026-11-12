@@ -30,13 +30,15 @@ var inProgressStates = map[string]string{
 // time, not a transaction over HEAD+index+worktree. Operations that
 // change state must re-verify against a fresh snapshot before acting.
 func (r *Repo) Snapshot(ctx context.Context) (*Snapshot, error) {
-	// -uall lists untracked files individually; -uno reports only the
-	// directory. PreferNoUntracked picks the cheap mode for repos whose
-	// untracked set is large enough that enumerating it dominates the
-	// refresh cost.
+	// -uall lists untracked files individually; -unormal collapses each
+	// untracked directory to one entry. PreferNoUntracked picks the cheap
+	// mode for repos whose untracked set is large enough that enumerating
+	// it dominates refresh cost — -uno hides untracked files entirely,
+	// which silently broke commits on repos that tripped the flood
+	// threshold.
 	untracked := "-uall"
 	if r.PreferNoUntracked {
-		untracked = "-uno"
+		untracked = "-unormal"
 	}
 	res, err := r.RunOK(ctx, "status", "--porcelain=v2", "-z", "--branch", untracked)
 	if err != nil {
@@ -125,23 +127,31 @@ func (r *Repo) EnableFSMonitor(ctx context.Context) {
 }
 
 // HeadResolution returns the symbolic name and OID of HEAD. Used by the
-// pre-commit re-check. Unborn HEAD returns "" for name.
+// pre-commit re-check. Detached HEAD returns "" for name; an unborn
+// branch (fresh repo, no commits yet) returns its ref name and "" OID —
+// that is a valid state to commit from, not an error.
 func (r *Repo) HeadResolution(ctx context.Context) (name, oid string, err error) {
-	res, err := r.RunOK(ctx, "rev-parse", "--symbolic-full-name", "HEAD")
+	// symbolic-ref exits 1 on detached HEAD; it works on unborn
+	// branches where rev-parse --symbolic-full-name fails.
+	res, err := r.Run(ctx, "symbolic-ref", "-q", "HEAD")
 	if err != nil {
-		// Unborn HEAD: symbolic-full-name fails.
-		res2, err2 := r.RunOK(ctx, "rev-parse", "HEAD")
-		if err2 != nil {
-			return "", "", &GitError{Args: []string{"rev-parse", "HEAD"}, Stderr: res2.OutputOfStderr()}
-		}
-		return "", strings.TrimSpace(res2.Output()), nil
+		return "", "", err
 	}
-	name = strings.TrimSpace(res.Output())
-	res3, err := r.RunOK(ctx, "rev-parse", "HEAD")
+	if res.ExitOK() {
+		name = strings.TrimSpace(res.Output())
+	}
+	res2, err := r.Run(ctx, "rev-parse", "-q", "--verify", "HEAD")
 	if err != nil {
 		return name, "", err
 	}
-	return name, strings.TrimSpace(res3.Output()), nil
+	if !res2.ExitOK() {
+		if name == "" {
+			// Neither a branch nor a commit: HEAD is broken.
+			return "", "", &GitError{Args: []string{"rev-parse", "--verify", "HEAD"}, Stderr: strings.TrimSpace(res2.OutputOfStderr())}
+		}
+		return name, "", nil // unborn branch
+	}
+	return name, strings.TrimSpace(res2.Output()), nil
 }
 
 // IsAncestor reports whether c1 is an ancestor of c2.

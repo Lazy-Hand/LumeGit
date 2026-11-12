@@ -58,7 +58,8 @@ type PushRequest struct {
 	SetUpstream bool
 	// ForceWithLease uses --force-with-lease (safer force push).
 	ForceWithLease bool
-	// Remote overrides the default remote ("origin").
+	// Remote overrides where to push. Empty = the branch's push remote
+	// / upstream remote, else "origin" or the repo's only remote.
 	Remote string
 	// Tags pushes all local tags along with the ref (git push --tags).
 	Tags bool
@@ -68,21 +69,18 @@ type PushRequest struct {
 // it pushes with -u so future ahead/behind tracking works.
 func (r *Repo) Push(ctx context.Context, req PushRequest) *SyncResult {
 	args := []string{"push"}
-	remote := req.Remote
-	if remote == "" {
-		remote = "origin"
+	tgt, terr := r.resolvePushTarget(ctx, req.Remote)
+	if terr != nil {
+		return &SyncResult{Op: "push", Err: terr}
 	}
-	up, uerr := r.Upstream(ctx)
 	switch {
-	case req.SetUpstream || (uerr == nil && !up.HasUpstream):
+	case req.SetUpstream || !tgt.HasUpstream:
 		// No upstream yet: -u sets it and pushes the named branch.
-		head, herr := r.headName(ctx)
-		if herr != nil || head == "" {
-			return &SyncResult{Op: "push", Err: fmt.Errorf("无法确定当前分支名（分离 HEAD 不能推送）")}
-		}
-		args = append(args, "-u", remote, head)
+		args = append(args, "-u", tgt.Remote, tgt.Head)
 	default:
-		args = append(args, remote, "HEAD")
+		// Explicit destination: the upstream may live on a remote not
+		// called origin, or under a different branch name.
+		args = append(args, tgt.Remote, "HEAD:"+tgt.Ref)
 	}
 	if req.ForceWithLease {
 		args = append(args, "--force-with-lease")
@@ -115,7 +113,7 @@ func (r *Repo) UnpushedCommits(ctx context.Context, maxCount int) ([]Commit, err
 			return nil, nil // detached HEAD: dialog shows a warning instead
 		}
 		res, err = r.Run(ctx, "log", "--format=%h%x1f%s%x1f%an%x1e",
-			"-n", fmt.Sprintf("%d", maxCount), head)
+			"-n", fmt.Sprintf("%d", maxCount), head, "--")
 	}
 	if err != nil {
 		return nil, err
@@ -190,6 +188,141 @@ func (r *Repo) Upstream(ctx context.Context) (Upstream, error) {
 		up.Behind, _ = strconv.Atoi(fields[1])
 	}
 	return up, nil
+}
+
+// pushTarget is where a push of the current branch goes.
+type pushTarget struct {
+	Head        string // local branch name
+	Remote      string // remote to push to
+	Ref         string // destination ref on that remote (refs/heads/…)
+	HasUpstream bool   // the branch tracks a remote branch
+}
+
+// resolvePushTarget works out the remote and destination ref for the
+// current branch, honoring git's own configuration instead of assuming
+// "origin" + same branch name:
+//
+//   - wantRemote set: push there (to the upstream ref when the upstream
+//     lives on that remote, else the same-named branch).
+//   - branch.<b>.pushRemote / remote.pushDefault differs from the
+//     upstream remote (triangular workflow): push the same-named branch
+//     there.
+//   - upstream set: its remote and its branch (names may differ).
+//   - no upstream: "origin" if it exists, else the only remote.
+func (r *Repo) resolvePushTarget(ctx context.Context, wantRemote string) (pushTarget, error) {
+	head, err := r.headName(ctx)
+	if err != nil {
+		return pushTarget{}, err
+	}
+	if head == "" {
+		return pushTarget{}, fmt.Errorf("无法确定当前分支名（分离 HEAD 不能推送）")
+	}
+	t := pushTarget{Head: head, Ref: "refs/heads/" + head}
+	res, err := r.Run(ctx, "for-each-ref",
+		"--format=%(upstream:remotename)%1f%(upstream:remoteref)%1f%(push:remotename)",
+		"refs/heads/"+head)
+	if err != nil {
+		return pushTarget{}, err
+	}
+	var upRemote, upRef, pushRemote string
+	if res.ExitOK() {
+		f := strings.Split(strings.TrimSpace(res.Output()), "\x1f")
+		if len(f) == 3 {
+			upRemote, upRef, pushRemote = f[0], f[1], f[2]
+		}
+	}
+	if upRemote == "." {
+		upRemote, upRef = "", "" // tracks a local branch: not a push target
+	}
+	t.HasUpstream = upRemote != ""
+
+	// push.default decides the destination ref whenever git would use
+	// it (upstream remote or triangular push remote). Modes:
+	//   upstream/tracking: push HEAD to the upstream branch (may differ
+	//     from the local name — the current default t.Ref case).
+	//   current: the same-named remote branch even when the upstream
+	//     has a different name.
+	//   simple: same-named branch, but git refuses when upstream exists
+	//     under a different name — we refuse too rather than mispush.
+	//   matching: same-named branch.
+	pushDefault := "simple"
+	if pd, perr := r.Run(ctx, "config", "--get", "push.default"); perr == nil && pd.ExitOK() {
+		if v := strings.TrimSpace(pd.Output()); v != "" {
+			pushDefault = v
+		}
+	}
+
+	switch {
+	case wantRemote != "":
+		t.Remote = wantRemote
+		if wantRemote == upRemote && upRef != "" {
+			t.Ref = upRef
+		}
+	case pushRemote != "" && pushRemote != "." && pushRemote != upRemote:
+		t.Remote = pushRemote
+	case upRemote != "":
+		t.Remote = upRemote
+		if upRef != "" {
+			t.Ref = upRef
+		}
+	default:
+		rm, err := r.defaultRemote(ctx)
+		if err != nil {
+			return pushTarget{}, err
+		}
+		t.Remote = rm
+	}
+
+	// push.default only applies when git's push.default machinery would
+	// kick in: pushing to the upstream remote (or a configured triangular
+	// push remote). An explicit other remote keeps the upstream ref only
+	// if that remote IS the upstream remote (handled above).
+	if t.Remote == upRemote && upRef != "" || (pushRemote != "" && t.Remote == pushRemote) {
+		switch pushDefault {
+		case "current", "matching":
+			t.Ref = "refs/heads/" + head
+		case "simple":
+			if upRef != "" && upRef != "refs/heads/"+head {
+				return pushTarget{}, fmt.Errorf(
+					"push.default=simple 不允许推送到上游 %s（与本地分支 %s 不同名）；请改用 push.default=upstream/current 或显式选择目标",
+					upRef, head)
+			}
+		case "upstream", "tracking":
+			// already the upstream ref (default when set above)
+		}
+	}
+	return t, nil
+}
+
+// defaultRemote picks a remote when nothing is configured: "origin" if
+// present, else the repository's only remote.
+func (r *Repo) defaultRemote(ctx context.Context) (string, error) {
+	res, err := r.RunOK(ctx, "remote")
+	if err != nil {
+		return "", err
+	}
+	names := strings.Fields(res.Output())
+	for _, n := range names {
+		if n == "origin" {
+			return n, nil
+		}
+	}
+	switch len(names) {
+	case 0:
+		return "", fmt.Errorf("没有配置远端仓库")
+	case 1:
+		return names[0], nil
+	}
+	return "", fmt.Errorf("有多个远端（%s）且当前分支未设置上游，请先设置上游", strings.Join(names, ", "))
+}
+
+// PushRemote returns the remote a plain push of the current branch
+// would use; detached HEAD falls back to the default remote.
+func (r *Repo) PushRemote(ctx context.Context) (string, error) {
+	if t, err := r.resolvePushTarget(ctx, ""); err == nil {
+		return t.Remote, nil
+	}
+	return r.defaultRemote(ctx)
 }
 
 // headName returns the current branch name, or "" on detached HEAD.

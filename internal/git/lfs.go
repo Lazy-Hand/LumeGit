@@ -38,20 +38,38 @@ func (r *Repo) LFSTracked(ctx context.Context) (*LFSTracked, error) {
 	if !res.ExitOK() {
 		return nil, &GitError{Args: []string{"lfs", "track"}, Stderr: res.OutputOfStderr()}
 	}
-	out := &LFSTracked{}
-	for _, ln := range strings.Split(res.Output(), "\n") {
-		ln = strings.TrimSpace(ln)
-		if ln == "" {
+	return parseLFSTrack(res.Output()), nil
+}
+
+// parseLFSTrack reads `git lfs track` output:
+//
+//	Listing tracked patterns
+//	    *.psd (.gitattributes)
+//	Listing excluded patterns
+//	    *.tmp (.gitattributes)
+//
+// Only the indented lines under the "tracked" heading are patterns; the
+// indentation must be checked BEFORE trimming.
+func parseLFSTrack(out string) *LFSTracked {
+	t := &LFSTracked{}
+	inTracked := false
+	for _, ln := range strings.Split(out, "\n") {
+		ln = strings.TrimRight(ln, "\r")
+		if strings.TrimSpace(ln) == "" {
 			continue
 		}
-		// Format: "Listing tracked patterns\n    *.psd (.gitattributes)\n"
-		// Take the first token of each indented line.
-		f := strings.Fields(ln)
-		if len(f) >= 1 && strings.HasPrefix(ln, " ") || strings.HasPrefix(ln, "\t") {
-			out.Patterns = append(out.Patterns, f[0])
+		if !strings.HasPrefix(ln, " ") && !strings.HasPrefix(ln, "\t") {
+			inTracked = strings.Contains(strings.ToLower(ln), "tracked")
+			continue
+		}
+		if !inTracked {
+			continue
+		}
+		if f := strings.Fields(ln); len(f) > 0 {
+			t.Patterns = append(t.Patterns, f[0])
 		}
 	}
-	return out, nil
+	return t
 }
 
 // LFSPathTracked reports whether path matches any tracked pattern —

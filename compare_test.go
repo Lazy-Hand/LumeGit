@@ -16,6 +16,7 @@ import (
 	"github.com/egoist/mygo/ui"
 
 	"lumegit/internal/git"
+	"lumegit/internal/vcs"
 )
 
 func gitT(t *testing.T, dir string, args ...string) {
@@ -42,13 +43,19 @@ func TestCompareSelectFile(t *testing.T) {
 
 	a := &app{}
 	a.commit.RepoPath = dir
-	sync := updater{update: func(fn func()) { fn() }}
+	pub := &testPublisher{}
+	sync := updater{update: pub.publish}
+	waitCmp := func() {
+		deadline := time.Now().Add(3 * time.Second)
+		for (a.compare.loading || a.compare.diffLoad) && time.Now().Before(deadline) {
+			pub.drain()
+			time.Sleep(20 * time.Millisecond)
+		}
+		pub.drain()
+	}
 
 	a.compare.openFor(dir, "b1", sync)
-	deadline := time.Now().Add(3 * time.Second)
-	for a.compare.loading && time.Now().Before(deadline) {
-		time.Sleep(20 * time.Millisecond)
-	}
+	waitCmp()
 	t.Logf("loading=%v err=%q files=%d cmp=%+v", a.compare.loading, a.compare.err, len(a.compare.files), a.compare.cmp)
 	if a.compare.err != "" {
 		t.Fatalf("load err: %s", a.compare.err)
@@ -58,10 +65,7 @@ func TestCompareSelectFile(t *testing.T) {
 	}
 
 	a.compare.selectFile(dir, a.compare.files[0].Path, sync)
-	deadline = time.Now().Add(3 * time.Second)
-	for a.compare.diffLoad && time.Now().Before(deadline) {
-		time.Sleep(20 * time.Millisecond)
-	}
+	waitCmp()
 	t.Logf("diff=%v err=%q", a.compare.diff != nil, a.compare.diffErr)
 	if a.compare.diffErr != "" {
 		t.Fatalf("diff err: %s", a.compare.diffErr)
@@ -91,13 +95,19 @@ func TestCompareBehindBranch(t *testing.T) {
 
 	a := &app{}
 	a.commit.RepoPath = dir
-	sync := updater{update: func(fn func()) { fn() }}
+	pub := &testPublisher{}
+	sync := updater{update: pub.publish}
+	waitCmp := func() {
+		deadline := time.Now().Add(3 * time.Second)
+		for (a.compare.loading || a.compare.diffLoad) && time.Now().Before(deadline) {
+			pub.drain()
+			time.Sleep(20 * time.Millisecond)
+		}
+		pub.drain()
+	}
 
 	a.compare.openFor(dir, "release", sync)
-	deadline := time.Now().Add(3 * time.Second)
-	for a.compare.loading && time.Now().Before(deadline) {
-		time.Sleep(20 * time.Millisecond)
-	}
+	waitCmp()
 	if a.compare.err != "" {
 		t.Fatalf("load err: %s", a.compare.err)
 	}
@@ -112,10 +122,7 @@ func TestCompareBehindBranch(t *testing.T) {
 
 	// Clicking a file diffs base→HEAD — the change HEAD has.
 	a.compare.selectFile(dir, "f.txt", sync)
-	deadline = time.Now().Add(3 * time.Second)
-	for a.compare.diffLoad && time.Now().Before(deadline) {
-		time.Sleep(20 * time.Millisecond)
-	}
+	waitCmp()
 	if a.compare.diffErr != "" {
 		t.Fatalf("diff err: %s", a.compare.diffErr)
 	}
@@ -142,14 +149,20 @@ func TestCompareWorktreeSelectFile(t *testing.T) {
 
 	a := &app{}
 	a.commit.RepoPath = dir
-	sync := updater{update: func(fn func()) { fn() }}
+	pub := &testPublisher{}
+	sync := updater{update: pub.publish}
+	waitCmp := func() {
+		deadline := time.Now().Add(3 * time.Second)
+		for (a.compare.loading || a.compare.diffLoad) && time.Now().Before(deadline) {
+			pub.drain()
+			time.Sleep(20 * time.Millisecond)
+		}
+		pub.drain()
+	}
 
 	// Whole-repo mode lists the tracked worktree diff.
 	a.compare.openForWorktree(dir, "HEAD", "", sync)
-	deadline := time.Now().Add(3 * time.Second)
-	for a.compare.loading && time.Now().Before(deadline) {
-		time.Sleep(20 * time.Millisecond)
-	}
+	waitCmp()
 	if a.compare.err != "" {
 		t.Fatalf("load err: %s", a.compare.err)
 	}
@@ -159,10 +172,7 @@ func TestCompareWorktreeSelectFile(t *testing.T) {
 
 	// A file in the worktree diff: old=HEAD blob, new=disk.
 	a.compare.selectFile(dir, "f.txt", sync)
-	deadline = time.Now().Add(3 * time.Second)
-	for a.compare.diffLoad && time.Now().Before(deadline) {
-		time.Sleep(20 * time.Millisecond)
-	}
+	waitCmp()
 	if a.compare.diffErr != "" {
 		t.Fatalf("diff err: %s", a.compare.diffErr)
 	}
@@ -172,10 +182,7 @@ func TestCompareWorktreeSelectFile(t *testing.T) {
 
 	// A path absent in HEAD (untracked): empty old side, not an error.
 	a.compare.selectFile(dir, "new.txt", sync)
-	deadline = time.Now().Add(3 * time.Second)
-	for a.compare.diffLoad && time.Now().Before(deadline) {
-		time.Sleep(20 * time.Millisecond)
-	}
+	waitCmp()
 	if a.compare.diffErr != "" {
 		t.Fatalf("untracked diff err: %s", a.compare.diffErr)
 	}
@@ -185,10 +192,7 @@ func TestCompareWorktreeSelectFile(t *testing.T) {
 
 	// Single-file mode opens straight onto the diff.
 	a.compare.openForWorktree(dir, "HEAD", "f.txt", sync)
-	deadline = time.Now().Add(3 * time.Second)
-	for a.compare.diffLoad && time.Now().Before(deadline) {
-		time.Sleep(20 * time.Millisecond)
-	}
+	waitCmp()
 	if a.compare.selected != "f.txt" || a.compare.diff == nil {
 		t.Fatalf("single-file open: selected=%q diff=%v", a.compare.selected, a.compare.diff)
 	}
@@ -213,14 +217,17 @@ func TestCompareOverlayClick(t *testing.T) {
 
 	a := &app{}
 	a.commit.RepoPath = dir
-	a.commit.publish = func(fn func()) { fn() } // sync updates
-	a.commit.Snap = &git.Snapshot{Worktree: dir, HeadName: "master"}
+	pub := &testPublisher{}
+	a.commit.publish = pub.publish
+	a.commit.Snap = vcs.WrapGit(&git.Snapshot{Worktree: dir, HeadName: "master"})
 
 	a.compare.openFor(dir, "b1", a.updater())
 	deadline := time.Now().Add(3 * time.Second)
 	for a.compare.loading && time.Now().Before(deadline) {
+		pub.drain()
 		time.Sleep(20 * time.Millisecond)
 	}
+	pub.drain()
 
 	tt := ui.NewTester(a.view, 1100, 700)
 	tt.Frame()
@@ -230,11 +237,13 @@ func TestCompareOverlayClick(t *testing.T) {
 	if err := tt.Click("f.txt"); err != nil {
 		t.Fatalf("row click: %v", err)
 	}
-	// selectFile is async even with sync publish — let it land.
+	// selectFile is async — drain publishes until it lands.
 	deadline = time.Now().Add(3 * time.Second)
 	for a.compare.diffLoad && time.Now().Before(deadline) {
+		pub.drain()
 		time.Sleep(20 * time.Millisecond)
 	}
+	pub.drain()
 	tt.Frame()
 	tt.Frame() // DiffView's first build may Invalidate for a second pass
 	if a.compare.diffErr != "" {

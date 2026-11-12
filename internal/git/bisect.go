@@ -89,7 +89,13 @@ func (r *Repo) BisectStatus(ctx context.Context) (*BisectStatus, error) {
 	}
 
 	// Current candidate: BISECT_HEAD is set while mid-bisect.
-	if res, err := r.Run(ctx, "rev-parse", "--verify", "BISECT_HEAD"); err == nil && res.ExitOK() {
+	// A normal bisect checks the candidate out as HEAD; BISECT_HEAD
+	// only exists for `bisect start --no-checkout`.
+	cur := "HEAD"
+	if fileExists(filepath.Join(gd, "BISECT_HEAD")) {
+		cur = "BISECT_HEAD"
+	}
+	if res, err := r.Run(ctx, "rev-parse", "--verify", cur); err == nil && res.ExitOK() {
 		st.CurrentOID = strings.TrimSpace(res.Output())
 		if res2, err := r.Run(ctx, "log", "-1", "--format=%s", st.CurrentOID); err == nil && res2.ExitOK() {
 			st.CurrentSub = strings.TrimSpace(res2.Output())

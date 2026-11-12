@@ -42,7 +42,8 @@ func (r *Repo) Worktrees(ctx context.Context) ([]Worktree, error) {
 		}
 		if strings.HasPrefix(ln, "worktree ") {
 			flush()
-			cur = &Worktree{Path: strings.TrimSpace(ln[len("worktree "):])}
+			// No TrimSpace: a path like " wt " is legal and real.
+			cur = &Worktree{Path: ln[len("worktree "):]}
 			continue
 		}
 		if cur == nil {

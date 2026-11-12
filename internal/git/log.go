@@ -107,8 +107,11 @@ func (r *Repo) LogFiltered(ctx context.Context, o LogOptions) ([]Commit, error) 
 	} else if o.Branch != "" {
 		args = append(args, o.Branch)
 	}
+	// Always end the revision list with "--": a branch named like a
+	// directory ("docs", "test") is otherwise ambiguous and git aborts.
+	args = append(args, "--")
 	if o.Path != "" {
-		args = append(args, "--", o.Path)
+		args = append(args, o.Path)
 	}
 	res, err := r.Run(ctx, args...)
 	if err != nil {
@@ -180,6 +183,18 @@ func parseRefs(dec string) []string {
 		}
 	}
 	return out
+}
+
+// CommitMessage returns the commit's full message (%B — subject plus
+// body). The log list only stores the subject line, so the amend dialog
+// needs this to avoid silently dropping the body on save.
+func (r *Repo) CommitMessage(ctx context.Context, oid string) (string, error) {
+	res, err := r.RunOK(ctx, "log", "-1", "--format=%B", oid)
+	if err != nil {
+		return "", err
+	}
+	// git appends a trailing newline to %B — strip exactly one.
+	return strings.TrimSuffix(string(res.Stdout), "\n"), nil
 }
 
 // CommitFiles lists the files a commit touched, via
